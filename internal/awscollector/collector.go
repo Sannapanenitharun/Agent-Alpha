@@ -17,6 +17,7 @@ import (
 	cloudwatchtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/signal-observability/collector/internal/agent"
 )
 
@@ -51,17 +52,24 @@ type CloudTrailAPI interface {
 	LookupEvents(context.Context, *cloudtrail.LookupEventsInput, ...func(*cloudtrail.Options)) (*cloudtrail.LookupEventsOutput, error)
 }
 
+type ECSAPI interface {
+	ListClusters(context.Context, *ecs.ListClustersInput, ...func(*ecs.Options)) (*ecs.ListClustersOutput, error)
+	ListServices(context.Context, *ecs.ListServicesInput, ...func(*ecs.Options)) (*ecs.ListServicesOutput, error)
+	DescribeServices(context.Context, *ecs.DescribeServicesInput, ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error)
+}
+
 type Collector struct {
 	config     Config
 	cloudwatch CloudWatchAPI
 	ec2        EC2API
 	cloudtrail CloudTrailAPI
+	ecs        ECSAPI
 	client     *http.Client
 	log        *slog.Logger
 	seenEvents map[string]struct{}
 }
 
-func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudtrailClient CloudTrailAPI, logger *slog.Logger) (*Collector, error) {
+func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudtrailClient CloudTrailAPI, logger *slog.Logger, optional ...ECSAPI) (*Collector, error) {
 	if config.TenantID == "" || config.Token == "" || config.IntakeURL == "" {
 		return nil, errors.New("tenant ID, token, and intake URL are required")
 	}
@@ -75,6 +83,9 @@ func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudt
 		logger = slog.Default()
 	}
 	collector := &Collector{config: config, cloudwatch: cloudwatchClient, ec2: ec2Client, cloudtrail: cloudtrailClient, client: &http.Client{Timeout: 15 * time.Second}, log: logger, seenEvents: map[string]struct{}{}}
+	if len(optional) > 0 {
+		collector.ecs = optional[0]
+	}
 	if config.StatePath != "" {
 		if err := collector.loadState(); err != nil {
 			return nil, err
@@ -90,6 +101,14 @@ func (c *Collector) Collect(ctx context.Context) ([]agent.Event, error) {
 		return nil, fmt.Errorf("collect EC2 inventory: %w", err)
 	}
 	events = append(events, inventory...)
+	if c.ecs != nil {
+		ecsEvents, ecsQueries, err := c.collectECS(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("collect ECS inventory: %w", err)
+		}
+		events = append(events, ecsEvents...)
+		discoveredQueries = append(discoveredQueries, ecsQueries...)
+	}
 	metrics, err := c.collectMetrics(ctx, discoveredQueries)
 	if err != nil {
 		return nil, fmt.Errorf("collect CloudWatch metrics: %w", err)

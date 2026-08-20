@@ -13,6 +13,8 @@ import (
 	cloudwatchtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 )
 
 type fakeCloudWatch struct{}
@@ -31,6 +33,20 @@ type fakeCloudTrail struct{}
 
 func (fakeCloudTrail) LookupEvents(context.Context, *cloudtrail.LookupEventsInput, ...func(*cloudtrail.Options)) (*cloudtrail.LookupEventsOutput, error) {
 	return &cloudtrail.LookupEventsOutput{Events: []cloudtrailtypes.Event{{EventId: aws.String("event-1"), EventName: aws.String("RunInstances")}}}, nil
+}
+
+type fakeECS struct{}
+
+func (fakeECS) ListClusters(context.Context, *ecs.ListClustersInput, ...func(*ecs.Options)) (*ecs.ListClustersOutput, error) {
+	return &ecs.ListClustersOutput{ClusterArns: []string{"arn:aws:ecs:us-east-1:123:cluster/prod"}}, nil
+}
+
+func (fakeECS) ListServices(context.Context, *ecs.ListServicesInput, ...func(*ecs.Options)) (*ecs.ListServicesOutput, error) {
+	return &ecs.ListServicesOutput{ServiceArns: []string{"arn:aws:ecs:us-east-1:123:service/prod/api"}}, nil
+}
+
+func (fakeECS) DescribeServices(context.Context, *ecs.DescribeServicesInput, ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error) {
+	return &ecs.DescribeServicesOutput{Services: []ecstypes.Service{{ServiceName: aws.String("api"), ServiceArn: aws.String("arn:aws:ecs:us-east-1:123:service/prod/api"), Status: aws.String("ACTIVE"), DesiredCount: 2, RunningCount: 2}}}, nil
 }
 
 func TestCollectsPhaseOneAWSSignals(t *testing.T) {
@@ -74,5 +90,19 @@ func TestCollectorDeduplicatesCloudTrailAcrossCycles(t *testing.T) {
 	}
 	if len(first) != 3 || len(second) != 2 {
 		t.Fatalf("expected duplicate audit event to be removed, got %d then %d events", len(first), len(second))
+	}
+}
+
+func TestCollectsECSInventoryAndQueries(t *testing.T) {
+	collector, err := New(Config{TenantID: "tenant-a", Token: "secret", IntakeURL: "http://intake", Region: "us-east-1"}, fakeCloudWatch{}, fakeEC2{}, fakeCloudTrail{}, slog.Default(), fakeECS{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := collector.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("expected EC2 inventory, ECS inventory, metric, and audit events; got %d", len(events))
 	}
 }

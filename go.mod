@@ -18,6 +18,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/cloudtrail v1.58.6 // indirect
 	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.66.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.321.3 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ecs v1.90.2 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.17 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.37 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.5.6 // indirect
