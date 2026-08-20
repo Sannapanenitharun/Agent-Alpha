@@ -1,0 +1,32 @@
+version: 1
+provider: aws
+collection:
+  regions: [us-east-1]
+  accounts: [self]
+  poll_interval: 60s
+  max_concurrent_api_calls: 20
+  assume_role:
+    enabled: false
+    role_arn: ""
+    external_id: ""
+services:
+  compute: [ec2, autoscaling, lambda, batch]
+  containers: [ecs, eks, fargate, ecr, apprunner]
+  web_and_app: [elastic_beanstalk, amplify, api_gateway, cloudfront, appsync]
+  messaging: [sqs, sns, eventbridge, kinesis, msk, mq, ses]
+  databases: [rds, aurora, dynamodb, elasticache, neptune, opensearch, redshift]
+  storage: [s3, efs, fsx, storage_gateway, backup]
+  networking: [vpc, transit_gateway, nat_gateway, alb, nlb, route53, direct_connect, vpn, privatelink]
+  security: [iam, kms, waf, shield, guardduty, inspector, macie, security_hub, cognito]
+  management: [cloudtrail, config, systems_manager, organizations, control_tower, service_catalog]
+  data_and_analytics: [glue, athena, emr, lake_formation, mwaa, firehose]
+  developer_tools: [codebuild, codedeploy, codepipeline, codecommit, cloudformation, cdk]
+  ai_ml: [sagemaker, bedrock, textract, comprehend, rekognition]
+paths:
+  cloudwatch_metrics: enabled
+  cloudwatch_logs: enabled
+  cloudtrail_events: enabled
+  eventbridge_events: enabled
+  s3_exports: enabled
+  vpc_flow_logs: enabled
+  workload_otlp: enabled

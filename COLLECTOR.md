@@ -34,7 +34,7 @@ Verify the process from the EC2 host:
 
 ```bash
 curl http://127.0.0.1:4318/healthz
-	docker logs --tail 50 signal-agent
+docker logs --tail 50 signal-agent
 ```
 
 The EC2 security group normally only needs outbound HTTPS access to the intake gateway. Open inbound `4317` or `4318` only when applications on other machines must send OTLP directly to this agent. For a single EC2 host, keep both ports bound to localhost and use a local OpenTelemetry Collector or application SDK.
