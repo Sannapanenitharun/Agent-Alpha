@@ -56,3 +56,23 @@ func TestCollectorDefaultsLookback(t *testing.T) {
 		t.Fatalf("unexpected lookback: %s", collector.config.Lookback)
 	}
 }
+
+func TestCollectorDeduplicatesCloudTrailAcrossCycles(t *testing.T) {
+	statePath := t.TempDir() + "\\state.json"
+	config := Config{TenantID: "tenant-a", Token: "secret", IntakeURL: "http://intake", StatePath: statePath}
+	collector, err := New(config, fakeCloudWatch{}, fakeEC2{}, fakeCloudTrail{}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := collector.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := collector.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 3 || len(second) != 2 {
+		t.Fatalf("expected duplicate audit event to be removed, got %d then %d events", len(first), len(second))
+	}
+}

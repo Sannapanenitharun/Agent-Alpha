@@ -38,7 +38,7 @@ func main() {
 		config.Credentials = aws.NewCredentialsCache(provider)
 		logger.Info("using cross-account AWS role", "role_arn", roleARN)
 	}
-	collector, err := awscollector.New(awscollector.Config{TenantID: os.Getenv("SIGNAL_TENANT_ID"), Token: os.Getenv("SIGNAL_INGEST_TOKEN"), IntakeURL: os.Getenv("SIGNAL_INTAKE_URL"), Region: region, Lookback: lookback()}, cloudwatch.NewFromConfig(config), ec2.NewFromConfig(config), cloudtrail.NewFromConfig(config), logger)
+	collector, err := awscollector.New(awscollector.Config{TenantID: os.Getenv("SIGNAL_TENANT_ID"), Token: os.Getenv("SIGNAL_INGEST_TOKEN"), IntakeURL: os.Getenv("SIGNAL_INTAKE_URL"), Region: region, Lookback: lookback(), StatePath: os.Getenv("SIGNAL_AWS_STATE_PATH")}, cloudwatch.NewFromConfig(config), ec2.NewFromConfig(config), cloudtrail.NewFromConfig(config), logger)
 	if err != nil {
 		logger.Error("AWS collector configuration failed", "error", err)
 		os.Exit(1)

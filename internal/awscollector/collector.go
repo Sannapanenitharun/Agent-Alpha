@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -35,6 +36,7 @@ type Config struct {
 	Region        string
 	MetricQueries []MetricQuery
 	Lookback      time.Duration
+	StatePath     string
 }
 
 type CloudWatchAPI interface {
@@ -56,6 +58,7 @@ type Collector struct {
 	cloudtrail CloudTrailAPI
 	client     *http.Client
 	log        *slog.Logger
+	seenEvents map[string]struct{}
 }
 
 func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudtrailClient CloudTrailAPI, logger *slog.Logger) (*Collector, error) {
@@ -71,36 +74,49 @@ func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudt
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Collector{config: config, cloudwatch: cloudwatchClient, ec2: ec2Client, cloudtrail: cloudtrailClient, client: &http.Client{Timeout: 15 * time.Second}, log: logger}, nil
+	collector := &Collector{config: config, cloudwatch: cloudwatchClient, ec2: ec2Client, cloudtrail: cloudtrailClient, client: &http.Client{Timeout: 15 * time.Second}, log: logger, seenEvents: map[string]struct{}{}}
+	if config.StatePath != "" {
+		if err := collector.loadState(); err != nil {
+			return nil, err
+		}
+	}
+	return collector, nil
 }
 
 func (c *Collector) Collect(ctx context.Context) ([]agent.Event, error) {
 	var events []agent.Event
-	metrics, err := c.collectMetrics(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("collect CloudWatch metrics: %w", err)
-	}
-	events = append(events, metrics...)
-	inventory, err := c.collectInventory(ctx)
+	inventory, discoveredQueries, err := c.collectInventory(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("collect EC2 inventory: %w", err)
 	}
 	events = append(events, inventory...)
+	metrics, err := c.collectMetrics(ctx, discoveredQueries)
+	if err != nil {
+		return nil, fmt.Errorf("collect CloudWatch metrics: %w", err)
+	}
+	events = append(events, metrics...)
 	audit, err := c.collectAuditEvents(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("collect CloudTrail events: %w", err)
 	}
-	return append(events, audit...), nil
+	events = append(events, audit...)
+	if c.config.StatePath != "" {
+		if err := c.saveState(); err != nil {
+			return nil, err
+		}
+	}
+	return events, nil
 }
 
-func (c *Collector) collectMetrics(ctx context.Context) ([]agent.Event, error) {
-	if len(c.config.MetricQueries) == 0 {
+func (c *Collector) collectMetrics(ctx context.Context, discovered []MetricQuery) ([]agent.Event, error) {
+	queriesToRun := append(append([]MetricQuery(nil), c.config.MetricQueries...), discovered...)
+	if len(queriesToRun) == 0 {
 		return nil, nil
 	}
 	end := time.Now().UTC()
 	start := end.Add(-c.config.Lookback)
-	queries := make([]cloudwatchtypes.MetricDataQuery, 0, len(c.config.MetricQueries))
-	for _, query := range c.config.MetricQueries {
+	queries := make([]cloudwatchtypes.MetricDataQuery, 0, len(queriesToRun))
+	for _, query := range queriesToRun {
 		dimensions := make([]cloudwatchtypes.Dimension, 0, len(query.Dimensions))
 		for name, value := range query.Dimensions {
 			dimensions = append(dimensions, cloudwatchtypes.Dimension{Name: aws.String(name), Value: aws.String(value)})
@@ -136,19 +152,34 @@ func (c *Collector) collectMetrics(ctx context.Context) ([]agent.Event, error) {
 	return events, nil
 }
 
-func (c *Collector) collectInventory(ctx context.Context) ([]agent.Event, error) {
-	output, err := c.ec2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{})
-	if err != nil {
-		return nil, err
-	}
+func (c *Collector) collectInventory(ctx context.Context) ([]agent.Event, []MetricQuery, error) {
 	var events []agent.Event
-	for _, reservation := range output.Reservations {
-		for _, instance := range reservation.Instances {
-			payload := map[string]any{"source": "aws.ec2", "region": c.config.Region, "instance_id": aws.ToString(instance.InstanceId), "instance_type": instance.InstanceType, "state": instance.State, "private_ip": aws.ToString(instance.PrivateIpAddress), "availability_zone": availabilityZone(instance)}
-			events = append(events, event("metrics", payload))
+	var queries []MetricQuery
+	input := &ec2.DescribeInstancesInput{}
+	for {
+		output, err := c.ec2.DescribeInstances(ctx, input)
+		if err != nil {
+			return nil, nil, err
 		}
+		for _, reservation := range output.Reservations {
+			for _, instance := range reservation.Instances {
+				instanceID := aws.ToString(instance.InstanceId)
+				payload := map[string]any{"source": "aws.ec2", "region": c.config.Region, "resource_type": "ec2_instance", "instance_id": instanceID, "instance_type": instance.InstanceType, "state": instance.State, "private_ip": aws.ToString(instance.PrivateIpAddress), "availability_zone": availabilityZone(instance)}
+				events = append(events, event("metrics", payload))
+				for _, metric := range []struct {
+					name      string
+					statistic string
+				}{{"CPUUtilization", "Average"}, {"NetworkIn", "Sum"}, {"NetworkOut", "Sum"}, {"StatusCheckFailed", "Maximum"}} {
+					queries = append(queries, MetricQuery{ID: "ec2_" + metric.name + "_" + instanceID, Namespace: "AWS/EC2", MetricName: metric.name, Statistic: metric.statistic, Period: 60, Dimensions: map[string]string{"InstanceId": instanceID}})
+				}
+			}
+		}
+		if output.NextToken == nil || aws.ToString(output.NextToken) == "" {
+			break
+		}
+		input.NextToken = output.NextToken
 	}
-	return events, nil
+	return events, queries, nil
 }
 
 func availabilityZone(instance types.Instance) string {
@@ -160,16 +191,63 @@ func availabilityZone(instance types.Instance) string {
 
 func (c *Collector) collectAuditEvents(ctx context.Context) ([]agent.Event, error) {
 	start := time.Now().UTC().Add(-c.config.Lookback)
-	output, err := c.cloudtrail.LookupEvents(ctx, &cloudtrail.LookupEventsInput{StartTime: &start, EndTime: awsTime(time.Now().UTC()), MaxResults: aws.Int32(50)})
-	if err != nil {
-		return nil, err
-	}
 	var events []agent.Event
-	for _, audit := range output.Events {
-		payload := map[string]any{"source": "aws.cloudtrail", "region": c.config.Region, "event_id": aws.ToString(audit.EventId), "event_name": aws.ToString(audit.EventName), "username": aws.ToString(audit.Username), "event_time": audit.EventTime, "cloud_trail_event": aws.ToString(audit.CloudTrailEvent)}
-		events = append(events, event("logs", payload))
+	input := &cloudtrail.LookupEventsInput{StartTime: &start, EndTime: awsTime(time.Now().UTC()), MaxResults: aws.Int32(50)}
+	for {
+		output, err := c.cloudtrail.LookupEvents(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for _, audit := range output.Events {
+			eventID := aws.ToString(audit.EventId)
+			if eventID != "" {
+				if _, seen := c.seenEvents[eventID]; seen {
+					continue
+				}
+				c.seenEvents[eventID] = struct{}{}
+			}
+			payload := map[string]any{"source": "aws.cloudtrail", "region": c.config.Region, "event_id": eventID, "event_name": aws.ToString(audit.EventName), "username": aws.ToString(audit.Username), "event_time": audit.EventTime, "cloud_trail_event": aws.ToString(audit.CloudTrailEvent)}
+			events = append(events, event("logs", payload))
+		}
+		if output.NextToken == nil || aws.ToString(output.NextToken) == "" {
+			break
+		}
+		input.NextToken = output.NextToken
 	}
 	return events, nil
+}
+
+func (c *Collector) loadState() error {
+	body, err := os.ReadFile(c.config.StatePath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read AWS collector state: %w", err)
+	}
+	var ids []string
+	if err := json.Unmarshal(body, &ids); err != nil {
+		return fmt.Errorf("decode AWS collector state: %w", err)
+	}
+	for _, id := range ids {
+		c.seenEvents[id] = struct{}{}
+	}
+	return nil
+}
+
+func (c *Collector) saveState() error {
+	ids := make([]string, 0, len(c.seenEvents))
+	for id := range c.seenEvents {
+		ids = append(ids, id)
+	}
+	body, err := json.Marshal(ids)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(c.config.StatePath, body, 0600); err != nil {
+		return fmt.Errorf("write AWS collector state: %w", err)
+	}
+	return nil
 }
 
 func awsTime(value time.Time) *time.Time { return &value }

@@ -7,6 +7,8 @@ COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/signal-aws-collector ./cmd/signal-aws-collector
 
 FROM gcr.io/distroless/static-debian12:nonroot
+WORKDIR /var/lib/signal
 COPY --from=build /out/signal-aws-collector /signal-aws-collector
+VOLUME ["/var/lib/signal"]
 USER nonroot:nonroot
 ENTRYPOINT ["/signal-aws-collector"]
