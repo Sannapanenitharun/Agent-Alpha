@@ -102,170 +102,233 @@ func serviceQueries(namespace, prefix, resource string, names ...string) []Metri
 }
 
 func (c *Collector) collectLambda(ctx context.Context, api LambdaAPI) ([]agent.Event, []MetricQuery, error) {
-	out, err := api.ListFunctions(ctx, &lambda.ListFunctionsInput{})
-	if err != nil {
-		return nil, nil, err
-	}
 	var events []agent.Event
 	var queries []MetricQuery
-	for _, fn := range out.Functions {
-		name := aws.ToString(fn.FunctionName)
-		events = append(events, event("metrics", map[string]any{"source": "aws.lambda", "region": c.config.Region, "resource_type": "lambda_function", "function": name, "runtime": fn.Runtime, "memory": fn.MemorySize}))
-		for _, q := range serviceQueries("AWS/Lambda", "lambda_", name, "Invocations", "Errors", "Duration", "Throttles") {
-			q.Dimensions = map[string]string{"FunctionName": name}
-			queries = append(queries, q)
+	input := &lambda.ListFunctionsInput{}
+	for {
+		out, err := api.ListFunctions(ctx, input)
+		if err != nil {
+			return nil, nil, err
 		}
+		for _, fn := range out.Functions {
+			name := aws.ToString(fn.FunctionName)
+			events = append(events, event("metrics", map[string]any{"source": "aws.lambda", "region": c.config.Region, "resource_type": "lambda_function", "function": name, "runtime": fn.Runtime, "memory": fn.MemorySize}))
+			for _, q := range serviceQueries("AWS/Lambda", "lambda_", name, "Invocations", "Errors", "Duration", "Throttles") {
+				q.Dimensions = map[string]string{"FunctionName": name}
+				queries = append(queries, q)
+			}
+		}
+		if out.NextMarker == nil || aws.ToString(out.NextMarker) == "" {
+			break
+		}
+		input.Marker = out.NextMarker
 	}
 	return events, queries, nil
 }
 
 func (c *Collector) collectRDS(ctx context.Context, api RDSAPI) ([]agent.Event, []MetricQuery, error) {
-	out, err := api.DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{})
-	if err != nil {
-		return nil, nil, err
-	}
 	var events []agent.Event
 	var queries []MetricQuery
-	for _, db := range out.DBInstances {
-		id := aws.ToString(db.DBInstanceIdentifier)
-		events = append(events, event("metrics", map[string]any{"source": "aws.rds", "region": c.config.Region, "resource_type": "rds_instance", "db_instance": id, "engine": db.Engine, "status": db.DBInstanceStatus, "class": db.DBInstanceClass}))
-		for _, q := range serviceQueries("AWS/RDS", "rds_", id, "CPUUtilization", "DatabaseConnections", "FreeStorageSpace", "ReadLatency", "WriteLatency") {
-			q.Dimensions = map[string]string{"DBInstanceIdentifier": id}
-			queries = append(queries, q)
+	input := &rds.DescribeDBInstancesInput{}
+	for {
+		out, err := api.DescribeDBInstances(ctx, input)
+		if err != nil {
+			return nil, nil, err
 		}
+		for _, db := range out.DBInstances {
+			id := aws.ToString(db.DBInstanceIdentifier)
+			events = append(events, event("metrics", map[string]any{"source": "aws.rds", "region": c.config.Region, "resource_type": "rds_instance", "db_instance": id, "engine": db.Engine, "status": db.DBInstanceStatus, "class": db.DBInstanceClass}))
+			for _, q := range serviceQueries("AWS/RDS", "rds_", id, "CPUUtilization", "DatabaseConnections", "FreeStorageSpace", "ReadLatency", "WriteLatency") {
+				q.Dimensions = map[string]string{"DBInstanceIdentifier": id}
+				queries = append(queries, q)
+			}
+		}
+		if out.Marker == nil || aws.ToString(out.Marker) == "" {
+			break
+		}
+		input.Marker = out.Marker
 	}
 	return events, queries, nil
 }
 
 func (c *Collector) collectDynamoDB(ctx context.Context, api DynamoDBAPI) ([]agent.Event, []MetricQuery, error) {
-	out, err := api.ListTables(ctx, &dynamodb.ListTablesInput{})
-	if err != nil {
-		return nil, nil, err
-	}
 	var events []agent.Event
 	var queries []MetricQuery
-	for _, name := range out.TableNames {
-		events = append(events, event("metrics", map[string]any{"source": "aws.dynamodb", "region": c.config.Region, "resource_type": "dynamodb_table", "table": name}))
-		for _, q := range serviceQueries("AWS/DynamoDB", "dynamodb_", name, "ConsumedReadCapacityUnits", "ConsumedWriteCapacityUnits", "ReadThrottleEvents", "WriteThrottleEvents") {
-			q.Dimensions = map[string]string{"TableName": name}
-			queries = append(queries, q)
+	input := &dynamodb.ListTablesInput{}
+	for {
+		out, err := api.ListTables(ctx, input)
+		if err != nil {
+			return nil, nil, err
 		}
+		for _, name := range out.TableNames {
+			events = append(events, event("metrics", map[string]any{"source": "aws.dynamodb", "region": c.config.Region, "resource_type": "dynamodb_table", "table": name}))
+			for _, q := range serviceQueries("AWS/DynamoDB", "dynamodb_", name, "ConsumedReadCapacityUnits", "ConsumedWriteCapacityUnits", "ReadThrottleEvents", "WriteThrottleEvents") {
+				q.Dimensions = map[string]string{"TableName": name}
+				queries = append(queries, q)
+			}
+		}
+		if out.LastEvaluatedTableName == nil || aws.ToString(out.LastEvaluatedTableName) == "" {
+			break
+		}
+		input.ExclusiveStartTableName = out.LastEvaluatedTableName
 	}
 	return events, queries, nil
 }
 
 func (c *Collector) collectSQS(ctx context.Context, api SQSAPI) ([]agent.Event, []MetricQuery, error) {
-	out, err := api.ListQueues(ctx, &sqs.ListQueuesInput{})
-	if err != nil {
-		return nil, nil, err
-	}
 	var events []agent.Event
 	var queries []MetricQuery
-	for _, url := range out.QueueUrls {
-		name := lastARNPart(url)
-		events = append(events, event("metrics", map[string]any{"source": "aws.sqs", "region": c.config.Region, "resource_type": "sqs_queue", "queue": name, "url": url}))
-		for _, q := range serviceQueries("AWS/SQS", "sqs_", name, "NumberOfMessagesSent", "NumberOfMessagesReceived", "ApproximateNumberOfMessagesVisible", "NumberOfMessagesDeleted") {
-			q.Dimensions = map[string]string{"QueueName": name}
-			queries = append(queries, q)
+	input := &sqs.ListQueuesInput{}
+	for {
+		out, err := api.ListQueues(ctx, input)
+		if err != nil {
+			return nil, nil, err
 		}
+		for _, url := range out.QueueUrls {
+			name := lastARNPart(url)
+			events = append(events, event("metrics", map[string]any{"source": "aws.sqs", "region": c.config.Region, "resource_type": "sqs_queue", "queue": name, "url": url}))
+			for _, q := range serviceQueries("AWS/SQS", "sqs_", name, "NumberOfMessagesSent", "NumberOfMessagesReceived", "ApproximateNumberOfMessagesVisible", "NumberOfMessagesDeleted") {
+				q.Dimensions = map[string]string{"QueueName": name}
+				queries = append(queries, q)
+			}
+		}
+		if out.NextToken == nil || aws.ToString(out.NextToken) == "" {
+			break
+		}
+		input.NextToken = out.NextToken
 	}
 	return events, queries, nil
 }
 
 func (c *Collector) collectSNS(ctx context.Context, api SNSAPI) ([]agent.Event, []MetricQuery, error) {
-	out, err := api.ListTopics(ctx, &sns.ListTopicsInput{})
-	if err != nil {
-		return nil, nil, err
-	}
 	var events []agent.Event
 	var queries []MetricQuery
-	for _, topic := range out.Topics {
-		arn := aws.ToString(topic.TopicArn)
-		name := lastARNPart(arn)
-		events = append(events, event("metrics", map[string]any{"source": "aws.sns", "region": c.config.Region, "resource_type": "sns_topic", "topic": name, "arn": arn}))
-		for _, q := range serviceQueries("AWS/SNS", "sns_", name, "NumberOfMessagesPublished", "NumberOfNotificationsDelivered", "NumberOfNotificationsFailed") {
-			q.Dimensions = map[string]string{"TopicName": name}
-			queries = append(queries, q)
+	input := &sns.ListTopicsInput{}
+	for {
+		out, err := api.ListTopics(ctx, input)
+		if err != nil {
+			return nil, nil, err
 		}
+		for _, topic := range out.Topics {
+			arn := aws.ToString(topic.TopicArn)
+			name := lastARNPart(arn)
+			events = append(events, event("metrics", map[string]any{"source": "aws.sns", "region": c.config.Region, "resource_type": "sns_topic", "topic": name, "arn": arn}))
+			for _, q := range serviceQueries("AWS/SNS", "sns_", name, "NumberOfMessagesPublished", "NumberOfNotificationsDelivered", "NumberOfNotificationsFailed") {
+				q.Dimensions = map[string]string{"TopicName": name}
+				queries = append(queries, q)
+			}
+		}
+		if out.NextToken == nil || aws.ToString(out.NextToken) == "" {
+			break
+		}
+		input.NextToken = out.NextToken
 	}
 	return events, queries, nil
 }
 
 func (c *Collector) collectELB(ctx context.Context, api ELBAPI) ([]agent.Event, []MetricQuery, error) {
-	out, err := api.DescribeLoadBalancers(ctx, &elasticloadbalancingv2.DescribeLoadBalancersInput{})
-	if err != nil {
-		return nil, nil, err
-	}
 	var events []agent.Event
 	var queries []MetricQuery
-	for _, lb := range out.LoadBalancers {
-		arn := aws.ToString(lb.LoadBalancerArn)
-		name := lastARNPart(arn)
-		ns := "AWS/ApplicationELB"
-		if lb.Type != "application" {
-			ns = "AWS/NetworkELB"
+	input := &elasticloadbalancingv2.DescribeLoadBalancersInput{}
+	for {
+		out, err := api.DescribeLoadBalancers(ctx, input)
+		if err != nil {
+			return nil, nil, err
 		}
-		events = append(events, event("metrics", map[string]any{"source": "aws.elb", "region": c.config.Region, "resource_type": "load_balancer", "name": name, "arn": arn, "state": lb.State, "type": lb.Type, "dns_name": lb.DNSName}))
-		for _, q := range serviceQueries(ns, "elb_", name, "RequestCount", "HTTPCode_Target_5XX_Count", "TargetResponseTime", "HealthyHostCount", "UnHealthyHostCount") {
-			q.Dimensions = map[string]string{"LoadBalancer": strings.TrimPrefix(name, "app/")}
-			queries = append(queries, q)
+		for _, lb := range out.LoadBalancers {
+			arn := aws.ToString(lb.LoadBalancerArn)
+			name := lastARNPart(arn)
+			ns := "AWS/ApplicationELB"
+			if lb.Type != "application" {
+				ns = "AWS/NetworkELB"
+			}
+			events = append(events, event("metrics", map[string]any{"source": "aws.elb", "region": c.config.Region, "resource_type": "load_balancer", "name": name, "arn": arn, "state": lb.State, "type": lb.Type, "dns_name": lb.DNSName}))
+			for _, q := range serviceQueries(ns, "elb_", name, "RequestCount", "HTTPCode_Target_5XX_Count", "TargetResponseTime", "HealthyHostCount", "UnHealthyHostCount") {
+				q.Dimensions = map[string]string{"LoadBalancer": strings.TrimPrefix(name, "app/")}
+				queries = append(queries, q)
+			}
 		}
+		if out.NextMarker == nil || aws.ToString(out.NextMarker) == "" {
+			break
+		}
+		input.Marker = out.NextMarker
 	}
 	return events, queries, nil
 }
 
 func (c *Collector) collectAPIGateway(ctx context.Context, api APIGatewayAPI) ([]agent.Event, []MetricQuery, error) {
-	out, err := api.GetApis(ctx, &apigatewayv2.GetApisInput{})
-	if err != nil {
-		return nil, nil, err
-	}
 	var events []agent.Event
 	var queries []MetricQuery
-	for _, item := range out.Items {
-		id := aws.ToString(item.ApiId)
-		events = append(events, event("metrics", map[string]any{"source": "aws.apigateway", "region": c.config.Region, "resource_type": "api_gateway", "api_id": id, "name": item.Name, "protocol": item.ProtocolType, "state": item.ApiEndpoint}))
-		for _, q := range serviceQueries("AWS/ApiGateway", "apigateway_", id, "Count", "4XXError", "5XXError", "Latency", "IntegrationLatency") {
-			q.Dimensions = map[string]string{"ApiId": id}
-			queries = append(queries, q)
+	input := &apigatewayv2.GetApisInput{}
+	for {
+		out, err := api.GetApis(ctx, input)
+		if err != nil {
+			return nil, nil, err
 		}
+		for _, item := range out.Items {
+			id := aws.ToString(item.ApiId)
+			events = append(events, event("metrics", map[string]any{"source": "aws.apigateway", "region": c.config.Region, "resource_type": "api_gateway", "api_id": id, "name": item.Name, "protocol": item.ProtocolType, "state": item.ApiEndpoint}))
+			for _, q := range serviceQueries("AWS/ApiGateway", "apigateway_", id, "Count", "4XXError", "5XXError", "Latency", "IntegrationLatency") {
+				q.Dimensions = map[string]string{"ApiId": id}
+				queries = append(queries, q)
+			}
+		}
+		if out.NextToken == nil || aws.ToString(out.NextToken) == "" {
+			break
+		}
+		input.NextToken = out.NextToken
 	}
 	return events, queries, nil
 }
 
 func (c *Collector) collectCloudFront(ctx context.Context, api CloudFrontAPI) ([]agent.Event, []MetricQuery, error) {
-	out, err := api.ListDistributions(ctx, &cloudfront.ListDistributionsInput{})
-	if err != nil {
-		return nil, nil, err
-	}
 	var events []agent.Event
 	var queries []MetricQuery
-	if out.DistributionList == nil {
-		return events, queries, nil
-	}
-	for _, dist := range out.DistributionList.Items {
-		id := aws.ToString(dist.Id)
-		events = append(events, event("metrics", map[string]any{"source": "aws.cloudfront", "region": "global", "resource_type": "cloudfront_distribution", "distribution": id, "domain": dist.DomainName, "status": dist.Status}))
-		for _, q := range serviceQueries("AWS/CloudFront", "cloudfront_", id, "Requests", "BytesDownloaded", "4xxErrorRate", "5xxErrorRate", "TotalErrorRate") {
-			q.Dimensions = map[string]string{"DistributionId": id, "Region": "Global"}
-			queries = append(queries, q)
+	input := &cloudfront.ListDistributionsInput{}
+	for {
+		out, err := api.ListDistributions(ctx, input)
+		if err != nil {
+			return nil, nil, err
 		}
+		if out.DistributionList == nil {
+			break
+		}
+		for _, dist := range out.DistributionList.Items {
+			id := aws.ToString(dist.Id)
+			events = append(events, event("metrics", map[string]any{"source": "aws.cloudfront", "region": "global", "resource_type": "cloudfront_distribution", "distribution": id, "domain": dist.DomainName, "status": dist.Status}))
+			for _, q := range serviceQueries("AWS/CloudFront", "cloudfront_", id, "Requests", "BytesDownloaded", "4xxErrorRate", "5xxErrorRate", "TotalErrorRate") {
+				q.Dimensions = map[string]string{"DistributionId": id, "Region": "Global"}
+				queries = append(queries, q)
+			}
+		}
+		if !aws.ToBool(out.DistributionList.IsTruncated) || aws.ToString(out.DistributionList.NextMarker) == "" {
+			break
+		}
+		input.Marker = out.DistributionList.NextMarker
 	}
 	return events, queries, nil
 }
 
 func (c *Collector) collectEKS(ctx context.Context, api EKSAPI) ([]agent.Event, []MetricQuery, error) {
-	out, err := api.ListClusters(ctx, &eks.ListClustersInput{})
-	if err != nil {
-		return nil, nil, err
-	}
 	var events []agent.Event
 	var queries []MetricQuery
-	for _, name := range out.Clusters {
-		events = append(events, event("metrics", map[string]any{"source": "aws.eks", "region": c.config.Region, "resource_type": "eks_cluster", "cluster": name}))
-		for _, q := range serviceQueries("ContainerInsights", "eks_", name, "cluster_node_count", "cluster_failed_node_count", "node_cpu_utilization", "node_memory_utilization") {
-			q.Dimensions = map[string]string{"ClusterName": name}
-			queries = append(queries, q)
+	input := &eks.ListClustersInput{}
+	for {
+		out, err := api.ListClusters(ctx, input)
+		if err != nil {
+			return nil, nil, err
 		}
+		for _, name := range out.Clusters {
+			events = append(events, event("metrics", map[string]any{"source": "aws.eks", "region": c.config.Region, "resource_type": "eks_cluster", "cluster": name}))
+			for _, q := range serviceQueries("ContainerInsights", "eks_", name, "cluster_node_count", "cluster_failed_node_count", "node_cpu_utilization", "node_memory_utilization") {
+				q.Dimensions = map[string]string{"ClusterName": name}
+				queries = append(queries, q)
+			}
+		}
+		if out.NextToken == nil || aws.ToString(out.NextToken) == "" {
+			break
+		}
+		input.NextToken = out.NextToken
 	}
 	return events, queries, nil
 }

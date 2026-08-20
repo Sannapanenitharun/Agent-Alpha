@@ -37,6 +37,7 @@ type Config struct {
 	Token         string
 	IntakeURL     string
 	Region        string
+	AccountID     string
 	MetricQueries []MetricQuery
 	Lookback      time.Duration
 	StatePath     string
@@ -180,7 +181,7 @@ func (c *Collector) collectMetrics(ctx context.Context, discovered []MetricQuery
 		}
 		for _, result := range output.MetricDataResults {
 			for index, value := range result.Values {
-				payload := map[string]any{"source": "aws.cloudwatch", "region": c.config.Region, "query_id": aws.ToString(result.Id), "value": value}
+				payload := map[string]any{"source": "aws.cloudwatch", "region": c.config.Region, "account_id": c.config.AccountID, "query_id": aws.ToString(result.Id), "value": value}
 				if index < len(result.Timestamps) {
 					payload["timestamp"] = result.Timestamps[index]
 				}
@@ -238,7 +239,7 @@ func (c *Collector) collectInventory(ctx context.Context) ([]agent.Event, []Metr
 		for _, reservation := range output.Reservations {
 			for _, instance := range reservation.Instances {
 				instanceID := aws.ToString(instance.InstanceId)
-				payload := map[string]any{"source": "aws.ec2", "region": c.config.Region, "resource_type": "ec2_instance", "instance_id": instanceID, "instance_type": instance.InstanceType, "state": instance.State, "private_ip": aws.ToString(instance.PrivateIpAddress), "availability_zone": availabilityZone(instance)}
+				payload := map[string]any{"source": "aws.ec2", "region": c.config.Region, "account_id": c.config.AccountID, "resource_type": "ec2_instance", "instance_id": instanceID, "instance_type": instance.InstanceType, "state": instance.State, "private_ip": aws.ToString(instance.PrivateIpAddress), "availability_zone": availabilityZone(instance)}
 				events = append(events, event("metrics", payload))
 				for _, metric := range []struct {
 					name      string
@@ -280,7 +281,7 @@ func (c *Collector) collectAuditEvents(ctx context.Context) ([]agent.Event, erro
 				}
 				c.seenEvents[eventID] = struct{}{}
 			}
-			payload := map[string]any{"source": "aws.cloudtrail", "region": c.config.Region, "event_id": eventID, "event_name": aws.ToString(audit.EventName), "username": aws.ToString(audit.Username), "event_time": audit.EventTime, "cloud_trail_event": aws.ToString(audit.CloudTrailEvent)}
+			payload := map[string]any{"source": "aws.cloudtrail", "region": c.config.Region, "account_id": c.config.AccountID, "event_id": eventID, "event_name": aws.ToString(audit.EventName), "username": aws.ToString(audit.Username), "event_time": audit.EventTime, "cloud_trail_event": aws.ToString(audit.CloudTrailEvent)}
 			events = append(events, event("logs", payload))
 		}
 		if output.NextToken == nil || aws.ToString(output.NextToken) == "" {

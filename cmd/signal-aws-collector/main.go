@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -24,6 +26,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/signal-observability/collector/internal/agent"
 	"github.com/signal-observability/collector/internal/awscollector"
 )
 
@@ -34,18 +37,39 @@ func main() {
 		logger.Error("AWS service configuration failed", "error", configErr)
 		os.Exit(1)
 	}
-	region := os.Getenv("AWS_REGION")
-	if region == "" {
-		if len(serviceConfig.Collection.Regions) > 0 {
-			region = serviceConfig.Collection.Regions[0]
-		} else {
-			region = "us-east-1"
-		}
+	interval := serviceConfig.Collection.PollInterval
+	if interval <= 0 {
+		interval = 60 * time.Second
 	}
-	config, err := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion(region))
+	if value, parseErr := strconv.Atoi(os.Getenv("SIGNAL_AWS_POLL_INTERVAL_SECONDS")); parseErr == nil && value > 0 {
+		interval = time.Duration(value) * time.Second
+	}
+	regions := serviceConfig.Collection.Regions
+	if configuredRegion := os.Getenv("AWS_REGION"); configuredRegion != "" {
+		regions = []string{configuredRegion}
+	}
+	if len(regions) == 0 {
+		regions = []string{"us-east-1"}
+	}
+	for {
+		for _, region := range regions {
+			ctx, cancel := context.WithTimeout(context.Background(), interval)
+			events, err := collectRegion(ctx, region, serviceConfig, logger)
+			cancel()
+			if err != nil {
+				logger.Error("AWS collection failed", "error", err, "region", region)
+				continue
+			}
+			logger.Info("AWS telemetry delivered", "events", len(events), "region", region)
+		}
+		time.Sleep(interval)
+	}
+}
+
+func collectRegion(ctx context.Context, region string, serviceConfig awscollector.ServiceConfig, logger *slog.Logger) ([]agent.Event, error) {
+	config, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
 	if err != nil {
-		logger.Error("AWS configuration failed", "error", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("AWS configuration: %w", err)
 	}
 	if roleARN := os.Getenv("SIGNAL_AWS_ROLE_ARN"); roleARN != "" {
 		externalID := os.Getenv("SIGNAL_AWS_EXTERNAL_ID")
@@ -55,34 +79,28 @@ func main() {
 			}
 		})
 		config.Credentials = aws.NewCredentialsCache(provider)
-		logger.Info("using cross-account AWS role", "role_arn", roleARN)
+	}
+	identity, err := sts.NewFromConfig(config).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return nil, fmt.Errorf("AWS identity lookup: %w", err)
 	}
 	services := &awscollector.Services{Lambda: lambda.NewFromConfig(config), RDS: rds.NewFromConfig(config), DynamoDB: dynamodb.NewFromConfig(config), SQS: sqs.NewFromConfig(config), SNS: sns.NewFromConfig(config), ELB: elasticloadbalancingv2.NewFromConfig(config), APIGateway: apigatewayv2.NewFromConfig(config), CloudFront: cloudfront.NewFromConfig(config), EKS: eks.NewFromConfig(config)}
-	collector, err := awscollector.New(awscollector.Config{TenantID: os.Getenv("SIGNAL_TENANT_ID"), Token: os.Getenv("SIGNAL_INGEST_TOKEN"), IntakeURL: os.Getenv("SIGNAL_INTAKE_URL"), Region: region, Lookback: lookback(), StatePath: os.Getenv("SIGNAL_AWS_STATE_PATH")}, cloudwatch.NewFromConfig(config), ec2.NewFromConfig(config), cloudtrail.NewFromConfig(config), logger, ecs.NewFromConfig(config), services)
+	statePath := os.Getenv("SIGNAL_AWS_STATE_PATH")
+	if statePath != "" {
+		statePath = strings.ReplaceAll(statePath, ".json", "-"+region+".json")
+	}
+	collector, err := awscollector.New(awscollector.Config{TenantID: os.Getenv("SIGNAL_TENANT_ID"), Token: os.Getenv("SIGNAL_INGEST_TOKEN"), IntakeURL: os.Getenv("SIGNAL_INTAKE_URL"), Region: region, AccountID: aws.ToString(identity.Account), Lookback: lookback(), StatePath: statePath}, cloudwatch.NewFromConfig(config), ec2.NewFromConfig(config), cloudtrail.NewFromConfig(config), logger, ecs.NewFromConfig(config), services)
 	if err != nil {
-		logger.Error("AWS collector configuration failed", "error", err)
-		os.Exit(1)
+		return nil, err
 	}
-	interval := serviceConfig.Collection.PollInterval
-	if interval <= 0 {
-		interval = 60 * time.Second
+	events, err := collector.Collect(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if value, parseErr := strconv.Atoi(os.Getenv("SIGNAL_AWS_POLL_INTERVAL_SECONDS")); parseErr == nil && value > 0 {
-		interval = time.Duration(value) * time.Second
+	if err := collector.Send(ctx, events); err != nil {
+		return nil, fmt.Errorf("intake delivery: %w", err)
 	}
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), interval)
-		events, collectErr := collector.Collect(ctx)
-		cancel()
-		if collectErr != nil {
-			logger.Error("AWS collection failed", "error", collectErr)
-		} else if sendErr := collector.Send(context.Background(), events); sendErr != nil {
-			logger.Error("AWS intake delivery failed", "error", sendErr)
-		} else {
-			logger.Info("AWS telemetry delivered", "events", len(events), "region", region)
-		}
-		time.Sleep(interval)
-	}
+	return events, nil
 }
 
 func lookback() time.Duration {
