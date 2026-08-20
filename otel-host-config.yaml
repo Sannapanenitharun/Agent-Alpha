@@ -1,0 +1,63 @@
+receivers:
+  hostmetrics:
+    root_path: /hostfs
+    collection_interval: 30s
+    scrapers:
+      cpu:
+      disk:
+      filesystem:
+      load:
+      memory:
+      network:
+      paging:
+      process:
+      processes:
+  filelog:
+    include:
+      - /hostfs/var/log/*.log
+      - /hostfs/var/log/messages
+      - /hostfs/var/log/syslog
+    exclude:
+      - /hostfs/var/log/*.gz
+    start_at: end
+    include_file_path: true
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: production
+        action: upsert
+      - key: host.role
+        value: ec2
+        action: upsert
+  batch:
+    timeout: 5s
+    send_batch_size: 100
+
+exporters:
+  otlp:
+    endpoint: 127.0.0.1:4317
+    headers:
+      authorization: "Bearer ${env:SIGNAL_INGEST_TOKEN}"
+    tls:
+      insecure: true
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [hostmetrics]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp]
+    logs:
+      receivers: [filelog]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp]
