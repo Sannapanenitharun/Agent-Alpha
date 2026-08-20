@@ -1,4 +1,21 @@
 services:
+  signal-aws-collector:
+    profiles: [aws]
+    build:
+      context: .
+      dockerfile: Dockerfile.aws
+    environment:
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_PROFILE: "${AWS_PROFILE:-}"
+      SIGNAL_AWS_ROLE_ARN: "${SIGNAL_AWS_ROLE_ARN:-}"
+      SIGNAL_AWS_EXTERNAL_ID: "${SIGNAL_AWS_EXTERNAL_ID:-}"
+      SIGNAL_AWS_POLL_INTERVAL_SECONDS: "${SIGNAL_AWS_POLL_INTERVAL_SECONDS:-60}"
+      SIGNAL_AWS_LOOKBACK_SECONDS: "${SIGNAL_AWS_LOOKBACK_SECONDS:-300}"
+      SIGNAL_INTAKE_URL: "${SIGNAL_INTAKE_URL:-http://signal-intake:8080/v1/intake}"
+      SIGNAL_TENANT_ID: "${SIGNAL_TENANT_ID:-tenant-dev}"
+      SIGNAL_INGEST_TOKEN: "${SIGNAL_INGEST_TOKEN:-local-only-token}"
+    restart: unless-stopped
+
   signal-intake:
     build:
       context: .

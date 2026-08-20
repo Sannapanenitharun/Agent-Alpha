@@ -64,6 +64,8 @@ AWS collector gateway
 Signal intake gateway -> buffers -> metrics/logs/traces storage -> dashboard
 ```
 
+      The AWS collector is an independent, opt-in service. Run it locally with `docker compose --profile aws up --build`, or deploy the image to ECS/Fargate with an ECS task role. For cross-account monitoring, set `SIGNAL_AWS_ROLE_ARN` and `SIGNAL_AWS_EXTERNAL_ID`; the collector uses the default AWS credential chain for its own account and STS `AssumeRole` for a customer account.
+
 ## Rollout phases
 
 ### Phase 1: foundational AWS coverage
