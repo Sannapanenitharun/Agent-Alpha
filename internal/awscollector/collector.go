@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -166,21 +168,62 @@ func (c *Collector) collectMetrics(ctx context.Context, discovered []MetricQuery
 			ReturnData: aws.Bool(true),
 		})
 	}
-	output, err := c.cloudwatch.GetMetricData(ctx, &cloudwatch.GetMetricDataInput{MetricDataQueries: queries, StartTime: &start, EndTime: &end})
-	if err != nil {
-		return nil, err
-	}
 	var events []agent.Event
-	for _, result := range output.MetricDataResults {
-		for index, value := range result.Values {
-			payload := map[string]any{"source": "aws.cloudwatch", "region": c.config.Region, "query_id": aws.ToString(result.Id), "value": value}
-			if index < len(result.Timestamps) {
-				payload["timestamp"] = result.Timestamps[index]
+	for offset := 0; offset < len(queries); offset += 500 {
+		endOffset := offset + 500
+		if endOffset > len(queries) {
+			endOffset = len(queries)
+		}
+		output, err := c.getMetricDataWithRetry(ctx, &cloudwatch.GetMetricDataInput{MetricDataQueries: queries[offset:endOffset], StartTime: &start, EndTime: &end})
+		if err != nil {
+			return nil, err
+		}
+		for _, result := range output.MetricDataResults {
+			for index, value := range result.Values {
+				payload := map[string]any{"source": "aws.cloudwatch", "region": c.config.Region, "query_id": aws.ToString(result.Id), "value": value}
+				if index < len(result.Timestamps) {
+					payload["timestamp"] = result.Timestamps[index]
+				}
+				events = append(events, event("metrics", payload))
 			}
-			events = append(events, event("metrics", payload))
 		}
 	}
 	return events, nil
+}
+
+func (c *Collector) getMetricDataWithRetry(ctx context.Context, input *cloudwatch.GetMetricDataInput) (*cloudwatch.GetMetricDataOutput, error) {
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		output, err := c.cloudwatch.GetMetricData(ctx, input)
+		if err == nil {
+			return output, nil
+		}
+		lastErr = err
+		if !isRetryableAWSError(err) {
+			return nil, err
+		}
+		if err := waitBackoff(ctx, attempt); err != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func isRetryableAWSError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "throttl") || strings.Contains(message, "rate exceeded") || strings.Contains(message, "timeout") || strings.Contains(message, "temporar")
+}
+
+func waitBackoff(ctx context.Context, attempt int) error {
+	delay := time.Duration(1<<attempt) * 100 * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *Collector) collectInventory(ctx context.Context) ([]agent.Event, []MetricQuery, error) {
@@ -302,13 +345,31 @@ func (c *Collector) Send(ctx context.Context, events []agent.Event) error {
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+c.config.Token)
-	response, err := c.client.Do(request)
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		response, err := c.client.Do(request)
+		if err == nil {
+			response.Body.Close()
+			if response.StatusCode >= 200 && response.StatusCode < 300 {
+				return nil
+			}
+			lastErr = fmt.Errorf("intake returned HTTP %d", response.StatusCode)
+			if response.StatusCode < 500 && response.StatusCode != http.StatusTooManyRequests {
+				return lastErr
+			}
+		} else {
+			lastErr = err
+		}
+		if err := waitBackoff(ctx, attempt); err != nil {
+			return err
+		}
+		request, err = http.NewRequestWithContext(ctx, http.MethodPost, c.config.IntakeURL, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+c.config.Token)
 	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("intake returned HTTP %d", response.StatusCode)
-	}
-	return nil
+	return lastErr
 }

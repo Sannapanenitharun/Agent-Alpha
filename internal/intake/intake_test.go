@@ -2,10 +2,13 @@ package intake
 
 import (
 	"bytes"
+	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,5 +121,46 @@ func TestServiceQueriesSummaryAndRecentTelemetry(t *testing.T) {
 		if endpoint != "/v1/summary" && payload["total"] != float64(2) {
 			t.Fatalf("unexpected telemetry total: %v", payload)
 		}
+	}
+}
+
+func TestAWSIngestionRoutes(t *testing.T) {
+	store := &memoryStore{}
+	service, err := New(Config{TenantID: "tenant-a", Token: "secret"}, store, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(service.Handler())
+	defer server.Close()
+
+	logsJSON := []byte(`{"logEvents":[{"id":"log-1","timestamp":123,"message":"hello"}]}`)
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(logsJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(compressed.Bytes())
+	for _, request := range []struct{ path, contentType, body string }{
+		{"/v1/aws/cloudwatch-logs", "application/json", `{"awslogs":{"data":"` + encoded + `"}}`},
+		{"/v1/aws/eventbridge", "application/json", `{"detail-type":"EC2 State Change"}`},
+		{"/v1/aws/s3", "application/json", `{"Records":[{"eventName":"ObjectCreated:Put"}]}`},
+	} {
+		req, _ := http.NewRequest(http.MethodPost, server.URL+request.path, strings.NewReader(request.body))
+		req.Header.Set("Authorization", "Bearer secret")
+		req.Header.Set("Content-Type", request.contentType)
+		response, requestErr := http.DefaultClient.Do(req)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusAccepted {
+			t.Fatalf("%s returned %d", request.path, response.StatusCode)
+		}
+	}
+	if len(store.events) != 3 {
+		t.Fatalf("expected 3 AWS events, got %d", len(store.events))
 	}
 }

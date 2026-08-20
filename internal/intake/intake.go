@@ -1,7 +1,9 @@
 package intake
 
 import (
+	"compress/gzip"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -120,6 +122,9 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/v1/intake", s.receive)
 	mux.HandleFunc("/v1/summary", s.summary)
 	mux.HandleFunc("/v1/telemetry", s.telemetry)
+	mux.HandleFunc("/v1/aws/cloudwatch-logs", s.awsCloudWatchLogs)
+	mux.HandleFunc("/v1/aws/eventbridge", s.awsEventBridge)
+	mux.HandleFunc("/v1/aws/s3", s.awsS3)
 	return mux
 }
 
@@ -235,6 +240,107 @@ func (s *Service) telemetry(w http.ResponseWriter, r *http.Request) {
 		events = events[len(events)-limit:]
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events, "total": total})
+}
+
+func (s *Service) awsCloudWatchLogs(w http.ResponseWriter, r *http.Request) {
+	s.receiveAWS(w, r, "aws.cloudwatch.logs", decodeCloudWatchLogs)
+}
+func (s *Service) awsEventBridge(w http.ResponseWriter, r *http.Request) {
+	s.receiveAWS(w, r, "aws.eventbridge", identityPayload)
+}
+func (s *Service) awsS3(w http.ResponseWriter, r *http.Request) {
+	s.receiveAWS(w, r, "aws.s3", identityPayload)
+}
+
+type awsPayloadDecoder func([]byte) ([]map[string]any, error)
+
+func (s *Service) receiveAWS(w http.ResponseWriter, r *http.Request, source string, decode awsPayloadDecoder) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid intake credentials"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 20<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "could not read AWS payload"})
+		return
+	}
+	items, err := decode(body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	stored := make([]StoredEvent, 0, len(items))
+	for _, item := range items {
+		item["source"] = source
+		payload, _ := json.Marshal(item)
+		stored = append(stored, StoredEvent{TenantID: s.config.TenantID, Received: time.Now().UTC(), Event: agent.Event{Type: "logs", Timestamp: time.Now().UTC(), Payload: payload}})
+	}
+	if len(stored) == 0 {
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "events": 0})
+		return
+	}
+	if err := s.store.Append(stored); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "telemetry persistence unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "events": len(stored)})
+}
+
+func identityPayload(body []byte) ([]map[string]any, error) {
+	var value any
+	if err := json.Unmarshal(body, &value); err != nil {
+		return nil, fmt.Errorf("invalid AWS JSON payload: %w", err)
+	}
+	if object, ok := value.(map[string]any); ok {
+		if records, ok := object["Records"].([]any); ok {
+			items := make([]map[string]any, 0, len(records))
+			for _, record := range records {
+				items = append(items, map[string]any{"record": record})
+			}
+			return items, nil
+		}
+	}
+	return []map[string]any{{"payload": value}}, nil
+}
+
+func decodeCloudWatchLogs(body []byte) ([]map[string]any, error) {
+	decoded := body
+	var wrapper struct {
+		AWSLogs struct {
+			Data string `json:"data"`
+		} `json:"awslogs"`
+	}
+	if err := json.Unmarshal(body, &wrapper); err == nil && wrapper.AWSLogs.Data != "" {
+		decoded, _ = base64.StdEncoding.DecodeString(wrapper.AWSLogs.Data)
+	} else if value, err := base64.StdEncoding.DecodeString(string(body)); err == nil {
+		decoded = value
+	}
+	if reader, err := gzip.NewReader(strings.NewReader(string(decoded))); err == nil {
+		defer reader.Close()
+		decoded, err = io.ReadAll(reader)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var envelope struct {
+		LogEvents []struct {
+			ID        string `json:"id"`
+			Timestamp int64  `json:"timestamp"`
+			Message   string `json:"message"`
+		} `json:"logEvents"`
+	}
+	if err := json.Unmarshal(decoded, &envelope); err != nil {
+		return nil, fmt.Errorf("invalid CloudWatch Logs payload: %w", err)
+	}
+	items := make([]map[string]any, 0, len(envelope.LogEvents))
+	for _, item := range envelope.LogEvents {
+		items = append(items, map[string]any{"event_id": item.ID, "timestamp": item.Timestamp, "message": item.Message})
+	}
+	return items, nil
 }
 
 func (s *Service) validate(envelope agent.Envelope) error {

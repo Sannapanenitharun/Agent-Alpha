@@ -12,11 +12,13 @@ services:
       SIGNAL_AWS_POLL_INTERVAL_SECONDS: "${SIGNAL_AWS_POLL_INTERVAL_SECONDS:-60}"
       SIGNAL_AWS_LOOKBACK_SECONDS: "${SIGNAL_AWS_LOOKBACK_SECONDS:-300}"
       SIGNAL_AWS_STATE_PATH: "/var/lib/signal/aws-state.json"
+      SIGNAL_AWS_CONFIG_PATH: "/etc/signal/aws-services.yaml"
       SIGNAL_INTAKE_URL: "${SIGNAL_INTAKE_URL:-http://signal-intake:8080/v1/intake}"
       SIGNAL_TENANT_ID: "${SIGNAL_TENANT_ID:-tenant-dev}"
       SIGNAL_INGEST_TOKEN: "${SIGNAL_INGEST_TOKEN:-local-only-token}"
     volumes:
       - signal-aws-state:/var/lib/signal
+      - ./config/aws-services.yaml:/etc/signal/aws-services.yaml:ro
     restart: unless-stopped
 
   signal-intake:

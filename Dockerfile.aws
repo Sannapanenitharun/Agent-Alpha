@@ -9,6 +9,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/signal-
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /var/lib/signal
 COPY --from=build /out/signal-aws-collector /signal-aws-collector
+COPY config/aws-services.yaml /etc/signal/aws-services.yaml
 VOLUME ["/var/lib/signal"]
 USER nonroot:nonroot
 ENTRYPOINT ["/signal-aws-collector"]

@@ -29,9 +29,18 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	serviceConfig, configErr := awscollector.LoadServiceConfig(os.Getenv("SIGNAL_AWS_CONFIG_PATH"))
+	if configErr != nil && os.Getenv("SIGNAL_AWS_CONFIG_PATH") != "" {
+		logger.Error("AWS service configuration failed", "error", configErr)
+		os.Exit(1)
+	}
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
-		region = "us-east-1"
+		if len(serviceConfig.Collection.Regions) > 0 {
+			region = serviceConfig.Collection.Regions[0]
+		} else {
+			region = "us-east-1"
+		}
 	}
 	config, err := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion(region))
 	if err != nil {
@@ -54,7 +63,10 @@ func main() {
 		logger.Error("AWS collector configuration failed", "error", err)
 		os.Exit(1)
 	}
-	interval := 60 * time.Second
+	interval := serviceConfig.Collection.PollInterval
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
 	if value, parseErr := strconv.Atoi(os.Getenv("SIGNAL_AWS_POLL_INTERVAL_SECONDS")); parseErr == nil && value > 0 {
 		interval = time.Duration(value) * time.Second
 	}
