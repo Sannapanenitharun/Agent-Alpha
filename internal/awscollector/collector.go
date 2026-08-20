@@ -64,12 +64,13 @@ type Collector struct {
 	ec2        EC2API
 	cloudtrail CloudTrailAPI
 	ecs        ECSAPI
+	services   *Services
 	client     *http.Client
 	log        *slog.Logger
 	seenEvents map[string]struct{}
 }
 
-func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudtrailClient CloudTrailAPI, logger *slog.Logger, optional ...ECSAPI) (*Collector, error) {
+func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudtrailClient CloudTrailAPI, logger *slog.Logger, optional ...any) (*Collector, error) {
 	if config.TenantID == "" || config.Token == "" || config.IntakeURL == "" {
 		return nil, errors.New("tenant ID, token, and intake URL are required")
 	}
@@ -83,8 +84,13 @@ func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudt
 		logger = slog.Default()
 	}
 	collector := &Collector{config: config, cloudwatch: cloudwatchClient, ec2: ec2Client, cloudtrail: cloudtrailClient, client: &http.Client{Timeout: 15 * time.Second}, log: logger, seenEvents: map[string]struct{}{}}
-	if len(optional) > 0 {
-		collector.ecs = optional[0]
+	for _, value := range optional {
+		switch client := value.(type) {
+		case ECSAPI:
+			collector.ecs = client
+		case *Services:
+			collector.services = client
+		}
 	}
 	if config.StatePath != "" {
 		if err := collector.loadState(); err != nil {
@@ -109,6 +115,12 @@ func (c *Collector) Collect(ctx context.Context) ([]agent.Event, error) {
 		events = append(events, ecsEvents...)
 		discoveredQueries = append(discoveredQueries, ecsQueries...)
 	}
+	serviceEvents, serviceQueries, err := c.collectServices(ctx, c.services)
+	if err != nil {
+		return nil, err
+	}
+	events = append(events, serviceEvents...)
+	discoveredQueries = append(discoveredQueries, serviceQueries...)
 	metrics, err := c.collectMetrics(ctx, discoveredQueries)
 	if err != nil {
 		return nil, fmt.Errorf("collect CloudWatch metrics: %w", err)

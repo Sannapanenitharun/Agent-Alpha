@@ -10,10 +10,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/apigatewayv2"
+	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
+	"github.com/aws/aws-sdk-go-v2/service/rds"
+	"github.com/aws/aws-sdk-go-v2/service/sns"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/signal-observability/collector/internal/awscollector"
 )
@@ -39,7 +48,8 @@ func main() {
 		config.Credentials = aws.NewCredentialsCache(provider)
 		logger.Info("using cross-account AWS role", "role_arn", roleARN)
 	}
-	collector, err := awscollector.New(awscollector.Config{TenantID: os.Getenv("SIGNAL_TENANT_ID"), Token: os.Getenv("SIGNAL_INGEST_TOKEN"), IntakeURL: os.Getenv("SIGNAL_INTAKE_URL"), Region: region, Lookback: lookback(), StatePath: os.Getenv("SIGNAL_AWS_STATE_PATH")}, cloudwatch.NewFromConfig(config), ec2.NewFromConfig(config), cloudtrail.NewFromConfig(config), logger, ecs.NewFromConfig(config))
+	services := &awscollector.Services{Lambda: lambda.NewFromConfig(config), RDS: rds.NewFromConfig(config), DynamoDB: dynamodb.NewFromConfig(config), SQS: sqs.NewFromConfig(config), SNS: sns.NewFromConfig(config), ELB: elasticloadbalancingv2.NewFromConfig(config), APIGateway: apigatewayv2.NewFromConfig(config), CloudFront: cloudfront.NewFromConfig(config), EKS: eks.NewFromConfig(config)}
+	collector, err := awscollector.New(awscollector.Config{TenantID: os.Getenv("SIGNAL_TENANT_ID"), Token: os.Getenv("SIGNAL_INGEST_TOKEN"), IntakeURL: os.Getenv("SIGNAL_INTAKE_URL"), Region: region, Lookback: lookback(), StatePath: os.Getenv("SIGNAL_AWS_STATE_PATH")}, cloudwatch.NewFromConfig(config), ec2.NewFromConfig(config), cloudtrail.NewFromConfig(config), logger, ecs.NewFromConfig(config), services)
 	if err != nil {
 		logger.Error("AWS collector configuration failed", "error", err)
 		os.Exit(1)
