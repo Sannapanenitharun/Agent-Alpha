@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
 	"github.com/signal-observability/collector/internal/agent"
 )
 
@@ -61,6 +62,10 @@ type ECSAPI interface {
 	DescribeServices(context.Context, *ecs.DescribeServicesInput, ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error)
 }
 
+type TaggingAPI interface {
+	GetResources(context.Context, *resourcegroupstaggingapi.GetResourcesInput, ...func(*resourcegroupstaggingapi.Options)) (*resourcegroupstaggingapi.GetResourcesOutput, error)
+}
+
 type Collector struct {
 	config     Config
 	cloudwatch CloudWatchAPI
@@ -68,6 +73,7 @@ type Collector struct {
 	cloudtrail CloudTrailAPI
 	ecs        ECSAPI
 	services   *Services
+	tags       TaggingAPI
 	client     *http.Client
 	log        *slog.Logger
 	seenEvents map[string]struct{}
@@ -93,6 +99,8 @@ func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudt
 			collector.ecs = client
 		case *Services:
 			collector.services = client
+		case TaggingAPI:
+			collector.tags = client
 		}
 	}
 	if config.StatePath != "" {
@@ -124,6 +132,13 @@ func (c *Collector) Collect(ctx context.Context) ([]agent.Event, error) {
 	}
 	events = append(events, serviceEvents...)
 	discoveredQueries = append(discoveredQueries, serviceQueries...)
+	if c.tags != nil {
+		tagEvents, err := c.collectTags(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("collect AWS resource tags: %w", err)
+		}
+		events = append(events, tagEvents...)
+	}
 	metrics, err := c.collectMetrics(ctx, discoveredQueries)
 	if err != nil {
 		return nil, fmt.Errorf("collect CloudWatch metrics: %w", err)

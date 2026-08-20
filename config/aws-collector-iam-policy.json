@@ -27,6 +27,14 @@
         "cloudtrail:LookupEvents"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "SignalReadResourceTags",
+      "Effect": "Allow",
+      "Action": [
+        "tag:GetResources"
+      ],
+      "Resource": "*"
     }
   ]
 }
