@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/signal-observability/collector/internal/intake"
 )
@@ -33,9 +38,30 @@ func main() {
 		logger.Error("intake configuration failed", "error", err)
 		os.Exit(1)
 	}
-	logger.Info("signal intake listening", "address", config.ListenAddress, "tenant", config.TenantID)
-	if err := http.ListenAndServe(config.ListenAddress, service.Handler()); err != nil {
-		logger.Error("intake stopped", "error", err)
-		os.Exit(1)
+	server := &http.Server{
+		Addr:              config.ListenAddress,
+		Handler:           service.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
+	go func() {
+		logger.Info("signal intake listening", "address", config.ListenAddress, "tenant", config.TenantID)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("intake stopped", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	logger.Info("shutdown requested")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Error("intake shutdown failed", "error", err)
+	}
+	logger.Info("shutdown complete")
 }

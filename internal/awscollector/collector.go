@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
-	"strings"
+	"sort"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -21,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
+	"github.com/aws/smithy-go"
 	"github.com/signal-observability/collector/internal/agent"
 )
 
@@ -76,7 +78,7 @@ type Collector struct {
 	tags       TaggingAPI
 	client     *http.Client
 	log        *slog.Logger
-	seenEvents map[string]struct{}
+	seenEvents map[string]time.Time
 }
 
 func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudtrailClient CloudTrailAPI, logger *slog.Logger, optional ...any) (*Collector, error) {
@@ -92,7 +94,7 @@ func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudt
 	if logger == nil {
 		logger = slog.Default()
 	}
-	collector := &Collector{config: config, cloudwatch: cloudwatchClient, ec2: ec2Client, cloudtrail: cloudtrailClient, client: &http.Client{Timeout: 15 * time.Second}, log: logger, seenEvents: map[string]struct{}{}}
+	collector := &Collector{config: config, cloudwatch: cloudwatchClient, ec2: ec2Client, cloudtrail: cloudtrailClient, client: &http.Client{Timeout: 15 * time.Second}, log: logger, seenEvents: map[string]time.Time{}}
 	for _, value := range optional {
 		switch client := value.(type) {
 		case ECSAPI:
@@ -111,50 +113,62 @@ func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudt
 	return collector, nil
 }
 
+// Collect gathers every configured source. A failure in one source no longer
+// discards the events already gathered from the others: a single throttled API
+// used to wipe out an entire collection cycle. Partial events are returned
+// alongside the joined errors so the caller can ship what succeeded.
 func (c *Collector) Collect(ctx context.Context) ([]agent.Event, error) {
 	var events []agent.Event
+	var problems []error
+
 	inventory, discoveredQueries, err := c.collectInventory(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("collect EC2 inventory: %w", err)
+		problems = append(problems, fmt.Errorf("collect EC2 inventory: %w", err))
 	}
 	events = append(events, inventory...)
+
 	if c.ecs != nil {
 		ecsEvents, ecsQueries, err := c.collectECS(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("collect ECS inventory: %w", err)
+			problems = append(problems, fmt.Errorf("collect ECS inventory: %w", err))
 		}
 		events = append(events, ecsEvents...)
 		discoveredQueries = append(discoveredQueries, ecsQueries...)
 	}
+
 	serviceEvents, serviceQueries, err := c.collectServices(ctx, c.services)
 	if err != nil {
-		return nil, err
+		problems = append(problems, err)
 	}
 	events = append(events, serviceEvents...)
 	discoveredQueries = append(discoveredQueries, serviceQueries...)
+
 	if c.tags != nil {
 		tagEvents, err := c.collectTags(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("collect AWS resource tags: %w", err)
+			problems = append(problems, fmt.Errorf("collect AWS resource tags: %w", err))
 		}
 		events = append(events, tagEvents...)
 	}
+
 	metrics, err := c.collectMetrics(ctx, discoveredQueries)
 	if err != nil {
-		return nil, fmt.Errorf("collect CloudWatch metrics: %w", err)
+		problems = append(problems, fmt.Errorf("collect CloudWatch metrics: %w", err))
 	}
 	events = append(events, metrics...)
+
 	audit, err := c.collectAuditEvents(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("collect CloudTrail events: %w", err)
+		problems = append(problems, fmt.Errorf("collect CloudTrail events: %w", err))
 	}
 	events = append(events, audit...)
+
 	if c.config.StatePath != "" {
 		if err := c.saveState(); err != nil {
-			return nil, err
+			problems = append(problems, err)
 		}
 	}
-	return events, nil
+	return events, errors.Join(problems...)
 }
 
 func (c *Collector) collectMetrics(ctx context.Context, discovered []MetricQuery) ([]agent.Event, error) {
@@ -190,18 +204,27 @@ func (c *Collector) collectMetrics(ctx context.Context, discovered []MetricQuery
 		if endOffset > len(queries) {
 			endOffset = len(queries)
 		}
-		output, err := c.getMetricDataWithRetry(ctx, &cloudwatch.GetMetricDataInput{MetricDataQueries: queries[offset:endOffset], StartTime: &start, EndTime: &end})
-		if err != nil {
-			return nil, err
-		}
-		for _, result := range output.MetricDataResults {
-			for index, value := range result.Values {
-				payload := map[string]any{"source": "aws.cloudwatch", "region": c.config.Region, "account_id": c.config.AccountID, "query_id": aws.ToString(result.Id), "value": value}
-				if index < len(result.Timestamps) {
-					payload["timestamp"] = result.Timestamps[index]
-				}
-				events = append(events, event("metrics", payload))
+		input := &cloudwatch.GetMetricDataInput{MetricDataQueries: queries[offset:endOffset], StartTime: &start, EndTime: &end}
+		// GetMetricData paginates. Without following NextToken every data point
+		// past the first page is silently lost.
+		for {
+			output, err := c.getMetricDataWithRetry(ctx, input)
+			if err != nil {
+				return nil, err
 			}
+			for _, result := range output.MetricDataResults {
+				for index, value := range result.Values {
+					payload := map[string]any{"source": "aws.cloudwatch", "region": c.config.Region, "account_id": c.config.AccountID, "query_id": aws.ToString(result.Id), "value": value}
+					if index < len(result.Timestamps) {
+						payload["timestamp"] = result.Timestamps[index]
+					}
+					events = append(events, event("metrics", payload))
+				}
+			}
+			if output.NextToken == nil || aws.ToString(output.NextToken) == "" {
+				break
+			}
+			input.NextToken = output.NextToken
 		}
 	}
 	return events, nil
@@ -225,9 +248,38 @@ func (c *Collector) getMetricDataWithRetry(ctx context.Context, input *cloudwatc
 	return nil, lastErr
 }
 
+// retryableAWSCodes are the AWS API error codes worth retrying. Matching on
+// codes is stable; matching on error text breaks whenever AWS rewords a message.
+var retryableAWSCodes = map[string]struct{}{
+	"ThrottlingException":         {},
+	"Throttling":                  {},
+	"ThrottledException":          {},
+	"RequestThrottled":            {},
+	"RequestThrottledException":   {},
+	"RequestLimitExceeded":        {},
+	"TooManyRequestsException":    {},
+	"LimitExceededException":      {},
+	"ServiceUnavailable":          {},
+	"ServiceUnavailableException": {},
+	"InternalError":               {},
+	"InternalFailure":             {},
+	"RequestTimeout":              {},
+	"RequestTimeoutException":     {},
+}
+
 func isRetryableAWSError(err error) bool {
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "throttl") || strings.Contains(message, "rate exceeded") || strings.Contains(message, "timeout") || strings.Contains(message, "temporar")
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		if _, ok := retryableAWSCodes[apiErr.ErrorCode()]; ok {
+			return true
+		}
+		return apiErr.ErrorFault() == smithy.FaultServer
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 func waitBackoff(ctx context.Context, attempt int) error {
@@ -294,7 +346,7 @@ func (c *Collector) collectAuditEvents(ctx context.Context) ([]agent.Event, erro
 				if _, seen := c.seenEvents[eventID]; seen {
 					continue
 				}
-				c.seenEvents[eventID] = struct{}{}
+				c.seenEvents[eventID] = time.Now().UTC()
 			}
 			payload := map[string]any{"source": "aws.cloudtrail", "region": c.config.Region, "account_id": c.config.AccountID, "event_id": eventID, "event_name": aws.ToString(audit.EventName), "username": aws.ToString(audit.Username), "event_time": audit.EventTime, "cloud_trail_event": aws.ToString(audit.CloudTrailEvent)}
 			events = append(events, event("logs", payload))
@@ -307,6 +359,14 @@ func (c *Collector) collectAuditEvents(ctx context.Context) ([]agent.Event, erro
 	return events, nil
 }
 
+// seenEventRetention bounds how long a CloudTrail event ID is remembered for
+// deduplication. Without it the map and its state file grow forever.
+const seenEventRetention = 24 * time.Hour
+
+// maxSeenEvents caps the map even inside the retention window, so an unusually
+// noisy account cannot exhaust memory.
+const maxSeenEvents = 100_000
+
 func (c *Collector) loadState() error {
 	body, err := os.ReadFile(c.config.StatePath)
 	if os.IsNotExist(err) {
@@ -315,27 +375,59 @@ func (c *Collector) loadState() error {
 	if err != nil {
 		return fmt.Errorf("read AWS collector state: %w", err)
 	}
-	var ids []string
-	if err := json.Unmarshal(body, &ids); err != nil {
-		return fmt.Errorf("decode AWS collector state: %w", err)
+	seen := map[string]time.Time{}
+	if err := json.Unmarshal(body, &seen); err != nil {
+		// Fall back to the original format, a bare array of event IDs, so an
+		// upgrade does not replay every event already reported.
+		var ids []string
+		if legacyErr := json.Unmarshal(body, &ids); legacyErr != nil {
+			return fmt.Errorf("decode AWS collector state: %w", err)
+		}
+		for _, id := range ids {
+			seen[id] = time.Now().UTC()
+		}
 	}
-	for _, id := range ids {
-		c.seenEvents[id] = struct{}{}
-	}
+	c.seenEvents = seen
+	c.pruneSeenEvents()
 	return nil
 }
 
-func (c *Collector) saveState() error {
+// pruneSeenEvents drops expired IDs, then trims oldest-first if the map is
+// still over capacity.
+func (c *Collector) pruneSeenEvents() {
+	cutoff := time.Now().UTC().Add(-seenEventRetention)
+	for id, seenAt := range c.seenEvents {
+		if seenAt.Before(cutoff) {
+			delete(c.seenEvents, id)
+		}
+	}
+	if len(c.seenEvents) <= maxSeenEvents {
+		return
+	}
 	ids := make([]string, 0, len(c.seenEvents))
 	for id := range c.seenEvents {
 		ids = append(ids, id)
 	}
-	body, err := json.Marshal(ids)
+	sort.Slice(ids, func(i, j int) bool { return c.seenEvents[ids[i]].Before(c.seenEvents[ids[j]]) })
+	for _, id := range ids[:len(ids)-maxSeenEvents] {
+		delete(c.seenEvents, id)
+	}
+}
+
+func (c *Collector) saveState() error {
+	c.pruneSeenEvents()
+	body, err := json.Marshal(c.seenEvents)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(c.config.StatePath, body, 0600); err != nil {
+	// Write to a temporary file and rename: a crash partway through a direct
+	// write would leave truncated JSON that fails to load on restart.
+	temporary := c.config.StatePath + ".tmp"
+	if err := os.WriteFile(temporary, body, 0600); err != nil {
 		return fmt.Errorf("write AWS collector state: %w", err)
+	}
+	if err := os.Rename(temporary, c.config.StatePath); err != nil {
+		return fmt.Errorf("replace AWS collector state: %w", err)
 	}
 	return nil
 }

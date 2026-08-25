@@ -2,7 +2,10 @@ package awscollector
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -30,6 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/smithy-go"
 )
 
 type fakeCloudWatch struct{}
@@ -191,4 +195,116 @@ type fakeEKS struct{}
 
 func (fakeEKS) ListClusters(context.Context, *eks.ListClustersInput, ...func(*eks.Options)) (*eks.ListClustersOutput, error) {
 	return &eks.ListClustersOutput{Clusters: []string{"prod"}}, nil
+}
+
+// pagedCloudWatch returns one data point per page across two pages.
+type pagedCloudWatch struct{ calls int }
+
+func (c *pagedCloudWatch) GetMetricData(_ context.Context, input *cloudwatch.GetMetricDataInput, _ ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricDataOutput, error) {
+	c.calls++
+	if input.NextToken == nil {
+		return &cloudwatch.GetMetricDataOutput{
+			MetricDataResults: []cloudwatchtypes.MetricDataResult{{Id: aws.String("cpu"), Values: []float64{1}}},
+			NextToken:         aws.String("page-2"),
+		}, nil
+	}
+	return &cloudwatch.GetMetricDataOutput{
+		MetricDataResults: []cloudwatchtypes.MetricDataResult{{Id: aws.String("cpu"), Values: []float64{2}}},
+	}, nil
+}
+
+func TestCollectMetricsFollowsPagination(t *testing.T) {
+	cloudwatchClient := &pagedCloudWatch{}
+	collector, err := New(Config{TenantID: "t", Token: "s", IntakeURL: "http://intake", MetricQueries: []MetricQuery{{ID: "cpu", Namespace: "AWS/EC2", MetricName: "CPUUtilization"}}}, cloudwatchClient, fakeEC2{}, fakeCloudTrail{}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := collector.collectMetrics(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cloudwatchClient.calls != 2 {
+		t.Fatalf("expected the second page to be requested, got %d calls", cloudwatchClient.calls)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected a data point from each page, got %d", len(events))
+	}
+}
+
+type failingCloudTrail struct{}
+
+func (failingCloudTrail) LookupEvents(context.Context, *cloudtrail.LookupEventsInput, ...func(*cloudtrail.Options)) (*cloudtrail.LookupEventsOutput, error) {
+	return nil, errors.New("AccessDenied")
+}
+
+// One failing source must not discard what the other sources already returned.
+func TestCollectReturnsPartialResultsWhenOneSourceFails(t *testing.T) {
+	collector, err := New(Config{TenantID: "t", Token: "s", IntakeURL: "http://intake"}, fakeCloudWatch{}, fakeEC2{}, failingCloudTrail{}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := collector.Collect(context.Background())
+	if err == nil {
+		t.Fatal("expected the CloudTrail failure to be reported")
+	}
+	if len(events) == 0 {
+		t.Fatal("EC2 inventory was discarded because CloudTrail failed")
+	}
+}
+
+func TestSeenEventsArePrunedAndPersistedAtomically(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	collector, err := New(Config{TenantID: "t", Token: "s", IntakeURL: "http://intake", StatePath: statePath}, fakeCloudWatch{}, fakeEC2{}, fakeCloudTrail{}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	collector.seenEvents["fresh"] = time.Now().UTC()
+	collector.seenEvents["stale"] = time.Now().UTC().Add(-2 * seenEventRetention)
+	if err = collector.saveState(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(statePath + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("temporary state file was left behind")
+	}
+
+	reloaded, err := New(Config{TenantID: "t", Token: "s", IntakeURL: "http://intake", StatePath: statePath}, fakeCloudWatch{}, fakeEC2{}, fakeCloudTrail{}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reloaded.seenEvents["fresh"]; !ok {
+		t.Error("recent event ID should survive a restart")
+	}
+	if _, ok := reloaded.seenEvents["stale"]; ok {
+		t.Error("expired event ID should have been pruned")
+	}
+}
+
+// State written by the previous release is a bare array of IDs.
+func TestLoadStateAcceptsLegacyFormat(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(statePath, []byte(`["event-1","event-2"]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	collector, err := New(Config{TenantID: "t", Token: "s", IntakeURL: "http://intake", StatePath: statePath}, fakeCloudWatch{}, fakeEC2{}, fakeCloudTrail{}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(collector.seenEvents) != 2 {
+		t.Fatalf("legacy state was not loaded: %d IDs", len(collector.seenEvents))
+	}
+}
+
+func TestRetryClassificationUsesErrorCodes(t *testing.T) {
+	throttled := &smithy.GenericAPIError{Code: "ThrottlingException", Message: "rate exceeded"}
+	if !isRetryableAWSError(throttled) {
+		t.Error("throttling should be retryable")
+	}
+	denied := &smithy.GenericAPIError{Code: "AccessDeniedException", Message: "no", Fault: smithy.FaultClient}
+	if isRetryableAWSError(denied) {
+		t.Error("access denied should not be retried")
+	}
+	// Error text mentioning "timeout" must not be enough on its own.
+	if isRetryableAWSError(errors.New("request timeout happened")) {
+		t.Error("plain error text should not drive retry decisions")
+	}
 }

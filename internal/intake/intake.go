@@ -1,6 +1,7 @@
 package intake
 
 import (
+	"bytes"
 	"compress/gzip"
 	"crypto/subtle"
 	"encoding/base64"
@@ -11,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -81,7 +83,7 @@ func (s *JSONLStore) List() ([]StoredEvent, error) {
 		return nil, fmt.Errorf("read intake storage: %w", err)
 	}
 	var events []StoredEvent
-	decoder := json.NewDecoder(strings.NewReader(string(contents)))
+	decoder := json.NewDecoder(bytes.NewReader(contents))
 	for {
 		var event StoredEvent
 		err := decoder.Decode(&event)
@@ -218,6 +220,15 @@ func (s *Service) telemetry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid intake credentials"})
 		return
 	}
+	limit := 100
+	if requested := r.URL.Query().Get("limit"); requested != "" {
+		parsed, err := strconv.Atoi(requested)
+		if err != nil || parsed < 1 || parsed > 500 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 500"})
+			return
+		}
+		limit = parsed
+	}
 	store, ok := s.store.(QueryStore)
 	if !ok {
 		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "query storage is not configured"})
@@ -227,13 +238,6 @@ func (s *Service) telemetry(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "telemetry query unavailable"})
 		return
-	}
-	limit := 100
-	if requested := r.URL.Query().Get("limit"); requested != "" {
-		if _, err := fmt.Sscanf(requested, "%d", &limit); err != nil || limit < 1 || limit > 500 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 500"})
-			return
-		}
 	}
 	total := len(events)
 	if total > limit {
@@ -319,7 +323,7 @@ func decodeCloudWatchLogs(body []byte) ([]map[string]any, error) {
 	} else if value, err := base64.StdEncoding.DecodeString(string(body)); err == nil {
 		decoded = value
 	}
-	if reader, err := gzip.NewReader(strings.NewReader(string(decoded))); err == nil {
+	if reader, err := gzip.NewReader(bytes.NewReader(decoded)); err == nil {
 		defer reader.Close()
 		decoded, err = io.ReadAll(reader)
 		if err != nil {

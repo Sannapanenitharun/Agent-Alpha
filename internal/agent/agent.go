@@ -10,9 +10,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -51,13 +51,20 @@ type Envelope struct {
 }
 
 type Collector struct {
-	config  Config
-	log     *slog.Logger
-	queue   chan Event
-	client  *http.Client
-	dropped atomic.Uint64
-	mu      sync.Mutex
+	config    Config
+	log       *slog.Logger
+	queue     chan Event
+	client    *http.Client
+	dropped   atomic.Uint64
+	delivered atomic.Uint64
+	cancel    context.CancelFunc
+	done      chan struct{}
 }
+
+// errPermanent marks a batch that can never be delivered no matter how often it
+// is retried. Retrying such a batch forever blocks every later event behind it,
+// so the pipeline drops it instead of stalling.
+var errPermanent = errors.New("permanently undeliverable")
 
 func New(config Config, logger *slog.Logger) (*Collector, error) {
 	if config.TenantID == "" || config.Token == "" {
@@ -78,13 +85,16 @@ func New(config Config, logger *slog.Logger) (*Collector, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	collector := &Collector{
 		config: config,
 		log:    logger,
 		queue:  make(chan Event, config.QueueSize),
 		client: &http.Client{Timeout: 10 * time.Second},
+		cancel: cancel,
+		done:   make(chan struct{}),
 	}
-	go collector.run(context.Background())
+	go collector.run(ctx)
 	return collector, nil
 }
 
@@ -92,6 +102,7 @@ func (c *Collector) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", c.health)
 	mux.HandleFunc("/readyz", c.ready)
+	mux.HandleFunc("/v1/stats", c.stats)
 	mux.HandleFunc("/v1/logs", func(w http.ResponseWriter, r *http.Request) { c.receive(w, r, "logs") })
 	mux.HandleFunc("/v1/metrics", func(w http.ResponseWriter, r *http.Request) { c.receive(w, r, "metrics") })
 	mux.HandleFunc("/v1/traces", func(w http.ResponseWriter, r *http.Request) { c.receive(w, r, "traces") })
@@ -111,6 +122,22 @@ func (c *Collector) health(w http.ResponseWriter, _ *http.Request) {
 }
 func (c *Collector) ready(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+// stats reports the collector's own pipeline health. An observability agent
+// that cannot be observed is a blind spot during exactly the incidents it
+// exists to explain.
+func (c *Collector) stats(w http.ResponseWriter, r *http.Request) {
+	if !c.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid ingest credentials"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"queued":         len(c.queue),
+		"queue_capacity": cap(c.queue),
+		"delivered":      c.delivered.Load(),
+		"dropped":        c.dropped.Load(),
+	})
 }
 
 func (c *Collector) receive(w http.ResponseWriter, r *http.Request, eventType string) {
@@ -193,8 +220,26 @@ func (c *Collector) authorizedContext(ctx context.Context) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(c.config.Token)) == 1
 }
 
+// mediaType strips parameters such as "; charset=utf-8" and matches the type
+// exactly. Substring matching would treat "application/json-lines" as OTLP JSON.
+func mediaType(contentType string) string {
+	parsed, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return strings.ToLower(strings.TrimSpace(contentType))
+	}
+	return parsed
+}
+
 func decodePayload(eventType string, body []byte, contentType string) ([]byte, error) {
-	if !strings.Contains(contentType, "application/x-protobuf") && !strings.Contains(contentType, "application/json") {
+	switch mediaType(contentType) {
+	case "application/x-protobuf", "application/json":
+	default:
+		// Legacy passthrough for untyped JSON. The payload still has to be
+		// valid JSON: an unparseable payload would otherwise be accepted here
+		// and then fail to encode at delivery time, stalling the whole batch.
+		if !json.Valid(body) {
+			return nil, errors.New("payload must be OTLP or valid JSON")
+		}
 		return body, nil
 	}
 	var message proto.Message
@@ -208,7 +253,7 @@ func decodePayload(eventType string, body []byte, contentType string) ([]byte, e
 	default:
 		return nil, fmt.Errorf("unsupported signal type %q", eventType)
 	}
-	if strings.Contains(contentType, "application/json") {
+	if mediaType(contentType) == "application/json" {
 		if err := protojson.Unmarshal(body, message); err != nil {
 			return nil, fmt.Errorf("invalid OTLP JSON payload: %w", err)
 		}
@@ -296,41 +341,95 @@ func (c *Collector) authorized(r *http.Request) bool {
 }
 
 func (c *Collector) run(ctx context.Context) {
+	defer close(c.done)
 	batch := make([]Event, 0, c.config.BatchSize)
 	ticker := time.NewTicker(c.config.FlushInterval)
 	defer ticker.Stop()
-	flush := func() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if len(batch) == 0 {
-			return
-		}
-		if err := c.send(ctx, batch); err != nil {
-			c.log.Error("intake delivery failed", "error", err, "events", len(batch))
-			return
-		}
-		batch = batch[:0]
-	}
 	for {
 		select {
 		case event := <-c.queue:
 			batch = append(batch, event)
 			if len(batch) >= c.config.BatchSize {
-				flush()
+				batch = c.flush(ctx, batch)
 			}
 		case <-ticker.C:
-			flush()
+			batch = c.flush(ctx, batch)
 		case <-ctx.Done():
-			flush()
+			batch = c.drain(batch)
+			// The parent context is already cancelled, so give the final
+			// delivery its own deadline instead of failing immediately.
+			final, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			if remaining := c.flush(final, batch); len(remaining) > 0 {
+				c.dropped.Add(uint64(len(remaining)))
+				c.log.Error("events lost at shutdown", "events", len(remaining))
+			}
+			cancel()
 			return
 		}
+	}
+}
+
+// drain moves everything still queued into the batch so a shutdown delivers it
+// rather than discarding it.
+func (c *Collector) drain(batch []Event) []Event {
+	for {
+		select {
+		case event := <-c.queue:
+			batch = append(batch, event)
+		default:
+			return batch
+		}
+	}
+}
+
+// maxRetained bounds how many events a failing batch may hold. Without it, a
+// prolonged intake outage grows the batch until the process is killed.
+func (c *Collector) maxRetained() int {
+	return c.config.QueueSize
+}
+
+// flush attempts delivery and returns the events still awaiting it. A returned
+// empty slice means the batch is fully accounted for, whether delivered or
+// deliberately dropped.
+func (c *Collector) flush(ctx context.Context, batch []Event) []Event {
+	if len(batch) == 0 {
+		return batch
+	}
+	err := c.send(ctx, batch)
+	if err == nil {
+		c.delivered.Add(uint64(len(batch)))
+		return batch[:0]
+	}
+	if errors.Is(err, errPermanent) {
+		c.dropped.Add(uint64(len(batch)))
+		c.log.Error("dropping undeliverable batch", "error", err, "events", len(batch))
+		return batch[:0]
+	}
+	c.log.Error("intake delivery failed", "error", err, "events", len(batch))
+	if overflow := len(batch) - c.maxRetained(); overflow > 0 {
+		c.dropped.Add(uint64(overflow))
+		c.log.Warn("dropping oldest events awaiting retry", "events", overflow)
+		batch = append(batch[:0], batch[overflow:]...)
+	}
+	return batch
+}
+
+// Shutdown stops accepting new work, drains what is queued, and waits for the
+// final delivery attempt to finish or ctx to expire.
+func (c *Collector) Shutdown(ctx context.Context) error {
+	c.cancel()
+	select {
+	case <-c.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
 func (c *Collector) send(ctx context.Context, events []Event) error {
 	payload, err := json.Marshal(Envelope{TenantID: c.config.TenantID, Events: events})
 	if err != nil {
-		return fmt.Errorf("encode envelope: %w", err)
+		return fmt.Errorf("encode envelope: %w: %w", errPermanent, err)
 	}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {

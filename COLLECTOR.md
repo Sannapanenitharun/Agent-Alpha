@@ -115,8 +115,26 @@ and `NoNewPrivileges`. To view the data locally:
 
 ```bash
 ssh -i <key>.pem -L 18080:127.0.0.1:18080 ubuntu@<ec2-host>
-NEXT_PUBLIC_SIGNAL_API_URL=http://localhost:18080 npm run dev
+SIGNAL_API_URL=http://localhost:18080 SIGNAL_API_TOKEN=<token> npm run dev
 ```
 
 The `process` scraper cannot read `/proc/1/exe` without `CAP_SYS_PTRACE`; other
 host metrics are unaffected.
+
+## Dashboard credentials
+
+The dashboard reads telemetry through its own server-side proxy at
+`/api/signal`, which holds the intake token and forwards only the read-only
+`summary` and `telemetry` endpoints. Configure it with `SIGNAL_API_URL` and
+`SIGNAL_API_TOKEN`.
+
+Never use a `NEXT_PUBLIC_` prefix for the token. Next.js inlines those into the
+client bundle, and the intake token is a write credential that also authenticates
+`POST /v1/intake`. Routing through the proxy also keeps the browser request
+same-origin, which the intake service requires: it serves no CORS headers and
+answers preflight `OPTIONS` with 405.
+
+## Pipeline self-telemetry
+
+`GET /v1/stats` on the collector reports `queued`, `queue_capacity`,
+`delivered`, and `dropped`. It requires the ingest token.
