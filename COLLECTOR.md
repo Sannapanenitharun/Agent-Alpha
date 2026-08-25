@@ -193,6 +193,17 @@ docker run -d --name signal-agent   -p 4317:4317 -p 4318:4318   -e SIGNAL_INTAKE
 
 Build the image with `docker build -t signal-agent:latest .`.
 
+On PowerShell the `\` line continuations above are not understood — it uses a
+backtick instead. Simplest is to keep it on one line:
+
+```powershell
+docker run -d --name signal-agent -p 4317:4317 -p 4318:4318 -e SIGNAL_INTAKE_URL=https://intake.example.com/v1/intake -e SIGNAL_TENANT_ID=acme -e SIGNAL_INGEST_TOKEN=$env:SIGNAL_INGEST_TOKEN -e SIGNAL_AGENT_LISTEN_ADDRESS=:4318 -e SIGNAL_AGENT_GRPC_LISTEN_ADDRESS=:4317 signal-agent:latest
+```
+
+Note `$env:NAME` rather than `$NAME` for environment variables. If the compose
+stack is already running it owns 4317 and 4318, so either stop it first or map
+different host ports, for example `-p 14317:4317 -p 14318:4318`.
+
 ### Uninstall
 
 ```bash
