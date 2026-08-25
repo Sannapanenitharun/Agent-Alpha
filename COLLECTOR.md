@@ -159,3 +159,44 @@ An envelope may carry a `tenant_id`, but it is a claim, not identity: if it
 disagrees with the authenticated tenant the request is rejected with 400.
 Queries are scoped the same way, so one tenant's credential cannot read
 another's telemetry.
+
+## Installing the agent
+
+### Linux with systemd
+
+```bash
+sudo ./scripts/install-agent.sh   --intake-url https://intake.example.com/v1/intake   --tenant acme   --token "$SIGNAL_INGEST_TOKEN"
+```
+
+Run from a source checkout it builds the binary itself; otherwise pass
+`--binary /path/to/signal-agent`. Re-running upgrades in place: the binary is
+replaced and the service restarted.
+
+Listen addresses default to `127.0.0.1:4318` (HTTP) and `127.0.0.1:4317` (gRPC).
+Override with `--http-addr` / `--grpc-addr`, and bind beyond loopback only with
+TLS in front. Use `--no-start` to stage an install without enabling the service.
+
+The installer creates an unprivileged `signal` user, writes
+`/etc/signal/agent.env` as `0640 root:signal`, and runs the service with
+`NoNewPrivileges`, `ProtectSystem=strict`, and `ProtectHome`.
+
+```bash
+systemctl status signal-agent
+journalctl -u signal-agent -f
+```
+
+### Container
+
+```bash
+docker run -d --name signal-agent   -p 4317:4317 -p 4318:4318   -e SIGNAL_INTAKE_URL=https://intake.example.com/v1/intake   -e SIGNAL_TENANT_ID=acme   -e SIGNAL_INGEST_TOKEN="$SIGNAL_INGEST_TOKEN"   -e SIGNAL_AGENT_LISTEN_ADDRESS=:4318   -e SIGNAL_AGENT_GRPC_LISTEN_ADDRESS=:4317   signal-agent:latest
+```
+
+Build the image with `docker build -t signal-agent:latest .`.
+
+### Uninstall
+
+```bash
+sudo systemctl disable --now signal-agent
+sudo rm -rf /opt/signal/bin/signal-agent /etc/signal/agent.env             /etc/systemd/system/signal-agent.service
+sudo systemctl daemon-reload
+```

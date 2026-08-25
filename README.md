@@ -40,6 +40,15 @@ Run the dashboard against it:
 SIGNAL_API_URL=http://localhost:8080 SIGNAL_API_TOKEN=local-only-token npm run dev
 ```
 
+## Installing the agent on a host
+
+```bash
+sudo ./scripts/install-agent.sh   --intake-url https://intake.example.com/v1/intake   --tenant acme --token "$SIGNAL_INGEST_TOKEN"
+```
+
+See [COLLECTOR.md](COLLECTOR.md) for options, the container equivalent, and
+uninstall steps.
+
 ## Tests
 
 ```bash
