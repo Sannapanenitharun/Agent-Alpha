@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -18,6 +19,7 @@ import (
 	logsdatav1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	metricsdatav1 "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracedatav1 "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
@@ -172,5 +174,70 @@ func TestCollectorAcceptsAuthenticatedOTLPGRPC(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for gRPC intake delivery")
+	}
+}
+
+func TestCollectorAcceptsGzippedOTLP(t *testing.T) {
+	received := make(chan Envelope, 1)
+	intake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var envelope Envelope
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			t.Errorf("invalid envelope: %v", err)
+		}
+		received <- envelope
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer intake.Close()
+
+	collector, err := New(Config{IntakeURL: intake.URL, TenantID: "tenant-gzip", Token: "secret", BatchSize: 1, FlushInterval: time.Hour}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(collector.Handler())
+	defer server.Close()
+
+	raw, err := proto.Marshal(&metricsv1.ExportMetricsServiceRequest{ResourceMetrics: []*metricsdatav1.ResourceMetrics{{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err = writer.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/metrics", bytes.NewReader(compressed.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Set("Content-Encoding", "gzip")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("gzipped OTLP was not accepted: status %d", response.StatusCode)
+	}
+
+	select {
+	case envelope := <-received:
+		if len(envelope.Events) != 1 || envelope.Events[0].Type != "metrics" {
+			t.Fatalf("unexpected gzip envelope: %+v", envelope)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for gzipped OTLP delivery")
+	}
+}
+
+func TestCollectorGRPCAdvertisesGzipDecompressor(t *testing.T) {
+	if encoding.GetCompressor("gzip") == nil {
+		t.Fatal("gzip compressor is not registered; standard OTLP gRPC exporters will fail")
 	}
 }

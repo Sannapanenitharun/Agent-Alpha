@@ -74,3 +74,49 @@ Send `Authorization: Bearer <ingest-token>` or `X-Signal-Ingest-Token`. The pref
 ## Production hardening before GA
 
 Implement mTLS or signed short-lived agent credentials, persistent disk buffering, remote configuration, config reload, compression, payload redaction, rate telemetry, and a dead-letter path.
+
+## Compression
+
+Both transports accept gzip, which standard OTLP exporters enable by default:
+
+- HTTP: `Content-Encoding: gzip` is decompressed, bounded at 10 MiB before and after inflation.
+- gRPC: the gzip decompressor is registered, so exporters using the default
+  `compression: gzip` setting are accepted.
+
+Without this, an OTel exporter fails with
+`Unimplemented: grpc: Decompressor is not installed for grpc-encoding "gzip"`.
+
+## EC2 reference deployment
+
+Deployed on an Ubuntu 24.04 EC2 host. All listeners bind `127.0.0.1`;
+nothing is publicly exposed and no security-group change is required.
+
+| Component | Address | Managed by |
+|---|---|---|
+| signal-agent OTLP HTTP | `127.0.0.1:14318` | `signal-agent.service` |
+| signal-agent OTLP gRPC | `127.0.0.1:14317` | `signal-agent.service` |
+| signal-intake | `127.0.0.1:18080` | `signal-intake.service` |
+| host metrics + logs scraper | otelcol-contrib | `signal-hostmetrics` container |
+
+Non-default ports are required because `4317`, `4318`, and `8080` are already
+taken on that host by `grafana/otel-lgtm` and `nginx-api-monitoring`.
+
+Layout:
+
+```text
+/opt/signal/bin/{signal-agent,signal-intake}   binaries
+/etc/signal/{agent,intake}.env                 credentials, 0640 root:signal
+/etc/signal/otel/host-config.yaml              scraper config
+/var/lib/signal/telemetry.jsonl                stored telemetry
+```
+
+Both services run as the unprivileged `signal` user with `ProtectSystem=strict`
+and `NoNewPrivileges`. To view the data locally:
+
+```bash
+ssh -i <key>.pem -L 18080:127.0.0.1:18080 ubuntu@<ec2-host>
+NEXT_PUBLIC_SIGNAL_API_URL=http://localhost:18080 npm run dev
+```
+
+The `process` scraper cannot read `/proc/1/exe` without `CAP_SYS_PTRACE`; other
+host metrics are unaffected.

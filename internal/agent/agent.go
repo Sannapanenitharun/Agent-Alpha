@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 	tracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	_ "google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -120,9 +122,9 @@ func (c *Collector) receive(w http.ResponseWriter, r *http.Request, eventType st
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid ingest credentials"})
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	body, err := readRequestBody(r)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "could not read payload"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
@@ -139,6 +141,30 @@ func (c *Collector) receive(w http.ResponseWriter, r *http.Request, eventType st
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
+}
+
+// maxPayloadBytes bounds both the compressed request body and the decompressed
+// result so a small gzip payload cannot expand into an unbounded allocation.
+const maxPayloadBytes = 10 << 20
+
+// readRequestBody reads an OTLP request body, transparently decompressing it
+// when the client sent Content-Encoding: gzip. Standard OTLP exporters enable
+// gzip by default, so this path is the common one in production.
+func readRequestBody(r *http.Request) ([]byte, error) {
+	var reader io.Reader = io.LimitReader(r.Body, maxPayloadBytes)
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Content-Encoding")), "gzip") {
+		decompressor, err := gzip.NewReader(reader)
+		if err != nil {
+			return nil, errors.New("could not read gzip payload")
+		}
+		defer decompressor.Close()
+		reader = io.LimitReader(decompressor, maxPayloadBytes)
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, errors.New("could not read payload")
+	}
+	return body, nil
 }
 
 func (c *Collector) enqueue(eventType string, payload []byte) error {
