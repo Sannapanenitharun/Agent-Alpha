@@ -1,0 +1,6 @@
+# Shell scripts and the Dockerfile must keep LF endings: they are executed on
+# Linux, and a CRLF shebang fails with "bad interpreter: bash^M".
+*.sh text eol=lf
+Dockerfile* text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
