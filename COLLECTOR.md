@@ -162,7 +162,36 @@ another's telemetry.
 
 ## Installing the agent
 
-### Linux with systemd
+### One line
+
+```bash
+curl -fsSL https://github.com/Sannapanenitharun/Agent-Alpha/releases/latest/download/get.sh   | sudo SIGNAL_INTAKE_URL=https://intake.example.com/v1/intake          SIGNAL_TENANT_ID=acme          SIGNAL_INGEST_TOKEN=your-token     bash
+```
+
+The bootstrap script detects the architecture, downloads the matching release
+binary, verifies its SHA-256 against the published `checksums.txt`, and refuses
+to install if the checksum does not match or the file cannot be verified.
+
+| Variable | Purpose |
+|---|---|
+| `SIGNAL_INTAKE_URL` | Required. Where the agent forwards telemetry |
+| `SIGNAL_TENANT_ID` | Required. Tenant this agent reports as |
+| `SIGNAL_INGEST_TOKEN` | Required. Ingest token for that tenant |
+| `SIGNAL_HTTP_ADDR` | OTLP HTTP listen address (default `127.0.0.1:4318`) |
+| `SIGNAL_GRPC_ADDR` | OTLP gRPC listen address (default `127.0.0.1:4317`) |
+| `SIGNAL_VERSION` | Pin a release, e.g. `v0.1.0` (default `latest`) |
+| `SIGNAL_DOWNLOAD_BASE` | Fetch assets from an internal mirror instead |
+
+Flags work too, for anything the variables do not cover:
+
+```bash
+curl -fsSL .../get.sh | sudo bash -s --   --intake-url https://intake.example.com/v1/intake   --tenant acme --token your-token --no-start
+```
+
+Pin `SIGNAL_VERSION` in automation. `latest` moves, so an unpinned install is
+not reproducible.
+
+### Linux with systemd, from a checkout
 
 ```bash
 sudo ./scripts/install-agent.sh   --intake-url https://intake.example.com/v1/intake   --tenant acme   --token "$SIGNAL_INGEST_TOKEN"

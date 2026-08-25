@@ -43,6 +43,12 @@ SIGNAL_API_URL=http://localhost:8080 SIGNAL_API_TOKEN=local-only-token npm run d
 ## Installing the agent on a host
 
 ```bash
+curl -fsSL https://github.com/Sannapanenitharun/Agent-Alpha/releases/latest/download/get.sh   | sudo SIGNAL_INTAKE_URL=https://intake.example.com/v1/intake          SIGNAL_TENANT_ID=acme SIGNAL_INGEST_TOKEN=your-token bash
+```
+
+Or from a checkout:
+
+```bash
 sudo ./scripts/install-agent.sh   --intake-url https://intake.example.com/v1/intake   --tenant acme --token "$SIGNAL_INGEST_TOKEN"
 ```
 
