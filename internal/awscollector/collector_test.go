@@ -113,7 +113,7 @@ func TestCollectorDeduplicatesCloudTrailAcrossCycles(t *testing.T) {
 }
 
 func TestCollectsECSInventoryAndQueries(t *testing.T) {
-	collector, err := New(Config{TenantID: "tenant-a", Token: "secret", IntakeURL: "http://intake", Region: "us-east-1"}, fakeCloudWatch{}, fakeEC2{}, fakeCloudTrail{}, slog.Default(), fakeECS{})
+	collector, err := New(Config{TenantID: "tenant-a", Token: "secret", IntakeURL: "http://intake", Region: "us-east-1"}, fakeCloudWatch{}, fakeEC2{}, fakeCloudTrail{}, slog.Default(), WithECS(fakeECS{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestCollectsRequestedServiceAdapters(t *testing.T) {
 	services := &Services{
 		Lambda: fakeLambda{}, RDS: fakeRDS{}, DynamoDB: fakeDynamoDB{}, SQS: fakeSQS{}, SNS: fakeSNS{}, ELB: fakeELB{}, APIGateway: fakeAPIGateway{}, CloudFront: fakeCloudFront{}, EKS: fakeEKS{},
 	}
-	collector, err := New(Config{TenantID: "tenant-a", Token: "secret", IntakeURL: "http://intake", Region: "us-east-1"}, fakeCloudWatch{}, fakeEC2{}, fakeCloudTrail{}, slog.Default(), services)
+	collector, err := New(Config{TenantID: "tenant-a", Token: "secret", IntakeURL: "http://intake", Region: "us-east-1"}, fakeCloudWatch{}, fakeEC2{}, fakeCloudTrail{}, slog.Default(), WithServices(services))
 	if err != nil {
 		t.Fatal(err)
 	}

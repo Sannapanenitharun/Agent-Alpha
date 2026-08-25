@@ -23,7 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
 	"github.com/aws/smithy-go"
-	"github.com/signal-observability/collector/internal/agent"
+	"github.com/signal-observability/collector/internal/telemetry"
 )
 
 type MetricQuery struct {
@@ -81,7 +81,29 @@ type Collector struct {
 	seenEvents map[string]time.Time
 }
 
-func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudtrailClient CloudTrailAPI, logger *slog.Logger, optional ...any) (*Collector, error) {
+// Option configures optional collector sources.
+//
+// These used to be passed as a variadic ...any and matched with a type switch,
+// which silently bound a client to the wrong field whenever one value satisfied
+// more than one of the interfaces.
+type Option func(*Collector)
+
+// WithECS enables ECS cluster and service collection.
+func WithECS(client ECSAPI) Option {
+	return func(c *Collector) { c.ecs = client }
+}
+
+// WithServices enables the per-service adapters.
+func WithServices(services *Services) Option {
+	return func(c *Collector) { c.services = services }
+}
+
+// WithTagging enables resource tag collection.
+func WithTagging(client TaggingAPI) Option {
+	return func(c *Collector) { c.tags = client }
+}
+
+func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudtrailClient CloudTrailAPI, logger *slog.Logger, options ...Option) (*Collector, error) {
 	if config.TenantID == "" || config.Token == "" || config.IntakeURL == "" {
 		return nil, errors.New("tenant ID, token, and intake URL are required")
 	}
@@ -95,15 +117,8 @@ func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudt
 		logger = slog.Default()
 	}
 	collector := &Collector{config: config, cloudwatch: cloudwatchClient, ec2: ec2Client, cloudtrail: cloudtrailClient, client: &http.Client{Timeout: 15 * time.Second}, log: logger, seenEvents: map[string]time.Time{}}
-	for _, value := range optional {
-		switch client := value.(type) {
-		case ECSAPI:
-			collector.ecs = client
-		case *Services:
-			collector.services = client
-		case TaggingAPI:
-			collector.tags = client
-		}
+	for _, option := range options {
+		option(collector)
 	}
 	if config.StatePath != "" {
 		if err := collector.loadState(); err != nil {
@@ -117,8 +132,8 @@ func New(config Config, cloudwatchClient CloudWatchAPI, ec2Client EC2API, cloudt
 // discards the events already gathered from the others: a single throttled API
 // used to wipe out an entire collection cycle. Partial events are returned
 // alongside the joined errors so the caller can ship what succeeded.
-func (c *Collector) Collect(ctx context.Context) ([]agent.Event, error) {
-	var events []agent.Event
+func (c *Collector) Collect(ctx context.Context) ([]telemetry.Event, error) {
+	var events []telemetry.Event
 	var problems []error
 
 	inventory, discoveredQueries, err := c.collectInventory(ctx)
@@ -171,7 +186,7 @@ func (c *Collector) Collect(ctx context.Context) ([]agent.Event, error) {
 	return events, errors.Join(problems...)
 }
 
-func (c *Collector) collectMetrics(ctx context.Context, discovered []MetricQuery) ([]agent.Event, error) {
+func (c *Collector) collectMetrics(ctx context.Context, discovered []MetricQuery) ([]telemetry.Event, error) {
 	queriesToRun := append(append([]MetricQuery(nil), c.config.MetricQueries...), discovered...)
 	if len(queriesToRun) == 0 {
 		return nil, nil
@@ -198,7 +213,7 @@ func (c *Collector) collectMetrics(ctx context.Context, discovered []MetricQuery
 			ReturnData: aws.Bool(true),
 		})
 	}
-	var events []agent.Event
+	var events []telemetry.Event
 	for offset := 0; offset < len(queries); offset += 500 {
 		endOffset := offset + 500
 		if endOffset > len(queries) {
@@ -294,8 +309,8 @@ func waitBackoff(ctx context.Context, attempt int) error {
 	}
 }
 
-func (c *Collector) collectInventory(ctx context.Context) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectInventory(ctx context.Context) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	input := &ec2.DescribeInstancesInput{}
 	for {
@@ -331,9 +346,9 @@ func availabilityZone(instance types.Instance) string {
 	return aws.ToString(instance.Placement.AvailabilityZone)
 }
 
-func (c *Collector) collectAuditEvents(ctx context.Context) ([]agent.Event, error) {
+func (c *Collector) collectAuditEvents(ctx context.Context) ([]telemetry.Event, error) {
 	start := time.Now().UTC().Add(-c.config.Lookback)
-	var events []agent.Event
+	var events []telemetry.Event
 	input := &cloudtrail.LookupEventsInput{StartTime: &start, EndTime: awsTime(time.Now().UTC()), MaxResults: aws.Int32(50)}
 	for {
 		output, err := c.cloudtrail.LookupEvents(ctx, input)
@@ -434,16 +449,16 @@ func (c *Collector) saveState() error {
 
 func awsTime(value time.Time) *time.Time { return &value }
 
-func event(eventType string, payload any) agent.Event {
+func event(eventType string, payload any) telemetry.Event {
 	body, _ := json.Marshal(payload)
-	return agent.Event{Type: eventType, Timestamp: time.Now().UTC(), Payload: body}
+	return telemetry.Event{Type: eventType, Timestamp: time.Now().UTC(), Payload: body}
 }
 
-func (c *Collector) Send(ctx context.Context, events []agent.Event) error {
+func (c *Collector) Send(ctx context.Context, events []telemetry.Event) error {
 	if len(events) == 0 {
 		return nil
 	}
-	body, err := json.Marshal(agent.Envelope{TenantID: c.config.TenantID, Events: events})
+	body, err := json.Marshal(telemetry.Envelope{TenantID: c.config.TenantID, Events: events})
 	if err != nil {
 		return err
 	}

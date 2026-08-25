@@ -11,91 +11,25 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/signal-observability/collector/internal/agent"
+	"github.com/signal-observability/collector/internal/telemetry"
 )
+
+// Tenant is one isolated customer of the platform.
+type Tenant struct {
+	ID    string `json:"id"`
+	Token string `json:"token"`
+}
 
 type Config struct {
 	ListenAddress string
-	Token         string
-	TenantID      string
 	StoragePath   string
-}
-
-type StoredEvent struct {
-	TenantID string      `json:"tenant_id"`
-	Received time.Time   `json:"received_at"`
-	Event    agent.Event `json:"event"`
-}
-
-type Store interface {
-	Append([]StoredEvent) error
-}
-
-type QueryStore interface {
-	Store
-	List() ([]StoredEvent, error)
-}
-
-type JSONLStore struct {
-	file *os.File
-	path string
-	mu   sync.Mutex
-}
-
-func NewJSONLStore(path string) (*JSONLStore, error) {
-	if path == "" {
-		return nil, errors.New("storage path is required")
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("open intake storage: %w", err)
-	}
-	return &JSONLStore{file: file, path: path}, nil
-}
-
-func (s *JSONLStore) Append(events []StoredEvent) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	encoder := json.NewEncoder(s.file)
-	for _, event := range events {
-		if err := encoder.Encode(event); err != nil {
-			return fmt.Errorf("write intake event: %w", err)
-		}
-	}
-	return nil
-}
-
-func (s *JSONLStore) Close() error {
-	return s.file.Close()
-}
-
-func (s *JSONLStore) List() ([]StoredEvent, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	contents, err := os.ReadFile(s.path)
-	if err != nil {
-		return nil, fmt.Errorf("read intake storage: %w", err)
-	}
-	var events []StoredEvent
-	decoder := json.NewDecoder(bytes.NewReader(contents))
-	for {
-		var event StoredEvent
-		err := decoder.Decode(&event)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("decode intake event: %w", err)
-		}
-		events = append(events, event)
-	}
-	return events, nil
+	// Tenants is the registry of accepted credentials. A request's tenant is
+	// resolved from the token it presents, never from anything in the payload.
+	Tenants []Tenant
 }
 
 type Service struct {
@@ -105,8 +39,18 @@ type Service struct {
 }
 
 func New(config Config, store Store, logger *slog.Logger) (*Service, error) {
-	if config.Token == "" || config.TenantID == "" {
-		return nil, errors.New("intake token and tenant ID are required")
+	if len(config.Tenants) == 0 {
+		return nil, errors.New("at least one tenant must be configured")
+	}
+	seen := map[string]struct{}{}
+	for _, tenant := range config.Tenants {
+		if tenant.ID == "" || tenant.Token == "" {
+			return nil, errors.New("every tenant requires an ID and a token")
+		}
+		if _, duplicate := seen[tenant.Token]; duplicate {
+			return nil, errors.New("tenants must not share an ingest token")
+		}
+		seen[tenant.Token] = struct{}{}
 	}
 	if store == nil {
 		return nil, errors.New("intake store is required")
@@ -143,7 +87,8 @@ func (s *Service) receive(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	if !s.authorized(r) {
+	tenant, ok := s.authenticate(r)
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid intake credentials"})
 		return
 	}
@@ -152,26 +97,27 @@ func (s *Service) receive(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "could not read intake payload"})
 		return
 	}
-	var envelope agent.Envelope
+	var envelope telemetry.Envelope
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid intake envelope"})
 		return
 	}
-	if err := s.validate(envelope); err != nil {
+	if err := s.validate(envelope, tenant); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	received := time.Now().UTC()
 	stored := make([]StoredEvent, 0, len(envelope.Events))
 	for _, event := range envelope.Events {
-		stored = append(stored, StoredEvent{TenantID: envelope.TenantID, Received: received, Event: event})
+		// Attribute to the authenticated tenant, not to the claim in the body.
+		stored = append(stored, StoredEvent{TenantID: tenant.ID, Received: received, Event: event})
 	}
 	if err := s.store.Append(stored); err != nil {
-		s.log.Error("intake persistence failed", "error", err, "tenant", envelope.TenantID, "events", len(stored))
+		s.log.Error("intake persistence failed", "error", err, "tenant", tenant.ID, "events", len(stored))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "telemetry persistence unavailable"})
 		return
 	}
-	s.log.Info("telemetry persisted", "tenant", envelope.TenantID, "events", len(stored))
+	s.log.Info("telemetry persisted", "tenant", tenant.ID, "events", len(stored))
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "events": len(stored)})
 }
 
@@ -180,7 +126,8 @@ func (s *Service) summary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	if !s.authorized(r) {
+	tenant, ok := s.authenticate(r)
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid intake credentials"})
 		return
 	}
@@ -189,26 +136,14 @@ func (s *Service) summary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "query storage is not configured"})
 		return
 	}
-	events, err := store.List()
+	// The tenant comes from the credential, so a caller cannot widen the query
+	// to another tenant's data.
+	summary, err := store.Summary(tenant.ID)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "telemetry query unavailable"})
 		return
 	}
-	response := map[string]any{"events": len(events), "logs": 0, "metrics": 0, "traces": 0, "last_received": nil}
-	for _, event := range events {
-		switch event.Event.Type {
-		case "logs":
-			response["logs"] = response["logs"].(int) + 1
-		case "metrics":
-			response["metrics"] = response["metrics"].(int) + 1
-		case "traces":
-			response["traces"] = response["traces"].(int) + 1
-		}
-		if latest, ok := response["last_received"].(time.Time); !ok || event.Received.After(latest) {
-			response["last_received"] = event.Received
-		}
-	}
-	writeJSON(w, http.StatusOK, response)
+	writeJSON(w, http.StatusOK, summary)
 }
 
 func (s *Service) telemetry(w http.ResponseWriter, r *http.Request) {
@@ -216,7 +151,8 @@ func (s *Service) telemetry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	if !s.authorized(r) {
+	tenant, ok := s.authenticate(r)
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid intake credentials"})
 		return
 	}
@@ -234,16 +170,17 @@ func (s *Service) telemetry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "query storage is not configured"})
 		return
 	}
-	events, err := store.List()
+	events, err := store.Recent(tenant.ID, limit)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "telemetry query unavailable"})
 		return
 	}
-	total := len(events)
-	if total > limit {
-		events = events[len(events)-limit:]
+	summary, err := store.Summary(tenant.ID)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "telemetry query unavailable"})
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"events": events, "total": total})
+	writeJSON(w, http.StatusOK, map[string]any{"events": events, "total": summary.Events})
 }
 
 func (s *Service) awsCloudWatchLogs(w http.ResponseWriter, r *http.Request) {
@@ -263,7 +200,8 @@ func (s *Service) receiveAWS(w http.ResponseWriter, r *http.Request, source stri
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	if !s.authorized(r) {
+	tenant, ok := s.authenticate(r)
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid intake credentials"})
 		return
 	}
@@ -281,7 +219,7 @@ func (s *Service) receiveAWS(w http.ResponseWriter, r *http.Request, source stri
 	for _, item := range items {
 		item["source"] = source
 		payload, _ := json.Marshal(item)
-		stored = append(stored, StoredEvent{TenantID: s.config.TenantID, Received: time.Now().UTC(), Event: agent.Event{Type: "logs", Timestamp: time.Now().UTC(), Payload: payload}})
+		stored = append(stored, StoredEvent{TenantID: tenant.ID, Received: time.Now().UTC(), Event: telemetry.Event{Type: "logs", Timestamp: time.Now().UTC(), Payload: payload}})
 	}
 	if len(stored) == 0 {
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "events": 0})
@@ -347,9 +285,12 @@ func decodeCloudWatchLogs(body []byte) ([]map[string]any, error) {
 	return items, nil
 }
 
-func (s *Service) validate(envelope agent.Envelope) error {
-	if envelope.TenantID == "" || envelope.TenantID != s.config.TenantID {
-		return errors.New("invalid tenant ID")
+func (s *Service) validate(envelope telemetry.Envelope, tenant Tenant) error {
+	// An envelope may omit the tenant, but if it names one it must be the
+	// tenant that authenticated. Anything else is an attempt to write into
+	// another customer's data.
+	if envelope.TenantID != "" && envelope.TenantID != tenant.ID {
+		return errors.New("envelope tenant does not match the authenticated tenant")
 	}
 	if len(envelope.Events) == 0 {
 		return errors.New("intake envelope contains no events")
@@ -358,7 +299,7 @@ func (s *Service) validate(envelope agent.Envelope) error {
 		return errors.New("intake envelope contains too many events")
 	}
 	for _, event := range envelope.Events {
-		if event.Type != "logs" && event.Type != "metrics" && event.Type != "traces" {
+		if !telemetry.ValidSignal(event.Type) {
 			return fmt.Errorf("unsupported event type %q", event.Type)
 		}
 		if len(event.Payload) == 0 || !json.Valid(event.Payload) {
@@ -368,12 +309,26 @@ func (s *Service) validate(envelope agent.Envelope) error {
 	return nil
 }
 
-func (s *Service) authorized(r *http.Request) bool {
+// authenticate resolves the caller's tenant from the presented token. Every
+// candidate is compared even after a match so the work does not depend on which
+// tenant is calling.
+func (s *Service) authenticate(r *http.Request) (Tenant, bool) {
 	provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	if provided == "" {
 		provided = r.Header.Get("X-Signal-Ingest-Token")
 	}
-	return subtle.ConstantTimeCompare([]byte(provided), []byte(s.config.Token)) == 1
+	if provided == "" {
+		return Tenant{}, false
+	}
+	var matched Tenant
+	found := false
+	for _, tenant := range s.config.Tenants {
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(tenant.Token)) == 1 {
+			matched = tenant
+			found = true
+		}
+	}
+	return matched, found
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -138,3 +138,24 @@ answers preflight `OPTIONS` with 405.
 
 `GET /v1/stats` on the collector reports `queued`, `queue_capacity`,
 `delivered`, and `dropped`. It requires the ingest token.
+
+## Tenants
+
+The intake gateway resolves a request's tenant from the bearer token it
+presents. Configure the registry with `SIGNAL_INTAKE_TENANTS_FILE`, a JSON array:
+
+```json
+[
+  {"id": "acme",   "token": "..."},
+  {"id": "globex", "token": "..."}
+]
+```
+
+Two tenants may not share a token — a shared token cannot identify a tenant, so
+the service refuses to start. For local development, `SIGNAL_INTAKE_TOKEN` plus
+`SIGNAL_INTAKE_TENANT_ID` still configure a single tenant.
+
+An envelope may carry a `tenant_id`, but it is a claim, not identity: if it
+disagrees with the authenticated tenant the request is rejected with 400.
+Queries are scoped the same way, so one tenant's credential cannot read
+another's telemetry.

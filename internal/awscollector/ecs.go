@@ -6,11 +6,11 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
-	"github.com/signal-observability/collector/internal/agent"
+	"github.com/signal-observability/collector/internal/telemetry"
 )
 
-func (c *Collector) collectECS(ctx context.Context) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectECS(ctx context.Context) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	clusters, err := c.ecs.ListClusters(ctx, &ecs.ListClustersInput{})
 	if err != nil {

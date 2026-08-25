@@ -90,7 +90,7 @@ func collectRegion(ctx context.Context, region string, serviceConfig awscollecto
 	if statePath != "" {
 		statePath = strings.ReplaceAll(statePath, ".json", "-"+region+".json")
 	}
-	collector, err := awscollector.New(awscollector.Config{TenantID: os.Getenv("SIGNAL_TENANT_ID"), Token: os.Getenv("SIGNAL_INGEST_TOKEN"), IntakeURL: os.Getenv("SIGNAL_INTAKE_URL"), Region: region, AccountID: aws.ToString(identity.Account), Lookback: lookback(), StatePath: statePath}, cloudwatch.NewFromConfig(config), ec2.NewFromConfig(config), cloudtrail.NewFromConfig(config), logger, ecs.NewFromConfig(config), services, resourcegroupstaggingapi.NewFromConfig(config))
+	collector, err := awscollector.New(awscollector.Config{TenantID: os.Getenv("SIGNAL_TENANT_ID"), Token: os.Getenv("SIGNAL_INGEST_TOKEN"), IntakeURL: os.Getenv("SIGNAL_INTAKE_URL"), Region: region, AccountID: aws.ToString(identity.Account), Lookback: lookback(), StatePath: statePath}, cloudwatch.NewFromConfig(config), ec2.NewFromConfig(config), cloudtrail.NewFromConfig(config), logger, awscollector.WithECS(ecs.NewFromConfig(config)), awscollector.WithServices(services), awscollector.WithTagging(resourcegroupstaggingapi.NewFromConfig(config)))
 	if err != nil {
 		return nil, err
 	}

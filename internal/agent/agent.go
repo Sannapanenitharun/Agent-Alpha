@@ -26,6 +26,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/signal-observability/collector/internal/telemetry"
 )
 
 type Config struct {
@@ -39,16 +41,11 @@ type Config struct {
 	QueueSize         int
 }
 
-type Event struct {
-	Type      string          `json:"type"`
-	Timestamp time.Time       `json:"timestamp"`
-	Payload   json.RawMessage `json:"payload"`
-}
+// Event and Envelope are the shared wire contract, aliased here so callers of
+// this package keep working unchanged.
+type Event = telemetry.Event
 
-type Envelope struct {
-	TenantID string  `json:"tenant_id"`
-	Events   []Event `json:"events"`
-}
+type Envelope = telemetry.Envelope
 
 type Collector struct {
 	config    Config

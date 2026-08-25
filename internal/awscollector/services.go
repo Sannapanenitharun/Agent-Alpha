@@ -15,7 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	"github.com/signal-observability/collector/internal/agent"
+	"github.com/signal-observability/collector/internal/telemetry"
 )
 
 type LambdaAPI interface {
@@ -58,26 +58,26 @@ type Services struct {
 	EKS        EKSAPI
 }
 
-func (c *Collector) collectServices(ctx context.Context, services *Services) ([]agent.Event, []MetricQuery, error) {
+func (c *Collector) collectServices(ctx context.Context, services *Services) ([]telemetry.Event, []MetricQuery, error) {
 	if services == nil {
 		return nil, nil, nil
 	}
-	var events []agent.Event
+	var events []telemetry.Event
 	var queries []MetricQuery
 	adapters := []struct {
 		name    string
 		enabled bool
-		collect func() ([]agent.Event, []MetricQuery, error)
+		collect func() ([]telemetry.Event, []MetricQuery, error)
 	}{
-		{"lambda", services.Lambda != nil, func() ([]agent.Event, []MetricQuery, error) { return c.collectLambda(ctx, services.Lambda) }},
-		{"rds", services.RDS != nil, func() ([]agent.Event, []MetricQuery, error) { return c.collectRDS(ctx, services.RDS) }},
-		{"dynamodb", services.DynamoDB != nil, func() ([]agent.Event, []MetricQuery, error) { return c.collectDynamoDB(ctx, services.DynamoDB) }},
-		{"sqs", services.SQS != nil, func() ([]agent.Event, []MetricQuery, error) { return c.collectSQS(ctx, services.SQS) }},
-		{"sns", services.SNS != nil, func() ([]agent.Event, []MetricQuery, error) { return c.collectSNS(ctx, services.SNS) }},
-		{"load_balancers", services.ELB != nil, func() ([]agent.Event, []MetricQuery, error) { return c.collectELB(ctx, services.ELB) }},
-		{"api_gateway", services.APIGateway != nil, func() ([]agent.Event, []MetricQuery, error) { return c.collectAPIGateway(ctx, services.APIGateway) }},
-		{"cloudfront", services.CloudFront != nil, func() ([]agent.Event, []MetricQuery, error) { return c.collectCloudFront(ctx, services.CloudFront) }},
-		{"eks", services.EKS != nil, func() ([]agent.Event, []MetricQuery, error) { return c.collectEKS(ctx, services.EKS) }},
+		{"lambda", services.Lambda != nil, func() ([]telemetry.Event, []MetricQuery, error) { return c.collectLambda(ctx, services.Lambda) }},
+		{"rds", services.RDS != nil, func() ([]telemetry.Event, []MetricQuery, error) { return c.collectRDS(ctx, services.RDS) }},
+		{"dynamodb", services.DynamoDB != nil, func() ([]telemetry.Event, []MetricQuery, error) { return c.collectDynamoDB(ctx, services.DynamoDB) }},
+		{"sqs", services.SQS != nil, func() ([]telemetry.Event, []MetricQuery, error) { return c.collectSQS(ctx, services.SQS) }},
+		{"sns", services.SNS != nil, func() ([]telemetry.Event, []MetricQuery, error) { return c.collectSNS(ctx, services.SNS) }},
+		{"load_balancers", services.ELB != nil, func() ([]telemetry.Event, []MetricQuery, error) { return c.collectELB(ctx, services.ELB) }},
+		{"api_gateway", services.APIGateway != nil, func() ([]telemetry.Event, []MetricQuery, error) { return c.collectAPIGateway(ctx, services.APIGateway) }},
+		{"cloudfront", services.CloudFront != nil, func() ([]telemetry.Event, []MetricQuery, error) { return c.collectCloudFront(ctx, services.CloudFront) }},
+		{"eks", services.EKS != nil, func() ([]telemetry.Event, []MetricQuery, error) { return c.collectEKS(ctx, services.EKS) }},
 	}
 	for _, adapter := range adapters {
 		if !adapter.enabled {
@@ -101,8 +101,8 @@ func serviceQueries(namespace, prefix, resource string, names ...string) []Metri
 	return queries
 }
 
-func (c *Collector) collectLambda(ctx context.Context, api LambdaAPI) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectLambda(ctx context.Context, api LambdaAPI) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	input := &lambda.ListFunctionsInput{}
 	for {
@@ -126,8 +126,8 @@ func (c *Collector) collectLambda(ctx context.Context, api LambdaAPI) ([]agent.E
 	return events, queries, nil
 }
 
-func (c *Collector) collectRDS(ctx context.Context, api RDSAPI) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectRDS(ctx context.Context, api RDSAPI) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	input := &rds.DescribeDBInstancesInput{}
 	for {
@@ -151,8 +151,8 @@ func (c *Collector) collectRDS(ctx context.Context, api RDSAPI) ([]agent.Event, 
 	return events, queries, nil
 }
 
-func (c *Collector) collectDynamoDB(ctx context.Context, api DynamoDBAPI) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectDynamoDB(ctx context.Context, api DynamoDBAPI) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	input := &dynamodb.ListTablesInput{}
 	for {
@@ -175,8 +175,8 @@ func (c *Collector) collectDynamoDB(ctx context.Context, api DynamoDBAPI) ([]age
 	return events, queries, nil
 }
 
-func (c *Collector) collectSQS(ctx context.Context, api SQSAPI) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectSQS(ctx context.Context, api SQSAPI) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	input := &sqs.ListQueuesInput{}
 	for {
@@ -200,8 +200,8 @@ func (c *Collector) collectSQS(ctx context.Context, api SQSAPI) ([]agent.Event, 
 	return events, queries, nil
 }
 
-func (c *Collector) collectSNS(ctx context.Context, api SNSAPI) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectSNS(ctx context.Context, api SNSAPI) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	input := &sns.ListTopicsInput{}
 	for {
@@ -226,8 +226,8 @@ func (c *Collector) collectSNS(ctx context.Context, api SNSAPI) ([]agent.Event, 
 	return events, queries, nil
 }
 
-func (c *Collector) collectELB(ctx context.Context, api ELBAPI) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectELB(ctx context.Context, api ELBAPI) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	input := &elasticloadbalancingv2.DescribeLoadBalancersInput{}
 	for {
@@ -256,8 +256,8 @@ func (c *Collector) collectELB(ctx context.Context, api ELBAPI) ([]agent.Event, 
 	return events, queries, nil
 }
 
-func (c *Collector) collectAPIGateway(ctx context.Context, api APIGatewayAPI) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectAPIGateway(ctx context.Context, api APIGatewayAPI) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	input := &apigatewayv2.GetApisInput{}
 	for {
@@ -281,8 +281,8 @@ func (c *Collector) collectAPIGateway(ctx context.Context, api APIGatewayAPI) ([
 	return events, queries, nil
 }
 
-func (c *Collector) collectCloudFront(ctx context.Context, api CloudFrontAPI) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectCloudFront(ctx context.Context, api CloudFrontAPI) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	input := &cloudfront.ListDistributionsInput{}
 	for {
@@ -309,8 +309,8 @@ func (c *Collector) collectCloudFront(ctx context.Context, api CloudFrontAPI) ([
 	return events, queries, nil
 }
 
-func (c *Collector) collectEKS(ctx context.Context, api EKSAPI) ([]agent.Event, []MetricQuery, error) {
-	var events []agent.Event
+func (c *Collector) collectEKS(ctx context.Context, api EKSAPI) ([]telemetry.Event, []MetricQuery, error) {
+	var events []telemetry.Event
 	var queries []MetricQuery
 	input := &eks.ListClustersInput{}
 	for {

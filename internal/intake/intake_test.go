@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/signal-observability/collector/internal/agent"
+	"github.com/signal-observability/collector/internal/telemetry"
 )
 
 type memoryStore struct {
@@ -24,8 +24,42 @@ func (store *memoryStore) Append(events []StoredEvent) error {
 	return nil
 }
 
-func (store *memoryStore) List() ([]StoredEvent, error) {
-	return append([]StoredEvent(nil), store.events...), nil
+// Summary and Recent filter by tenant, mirroring the production store so the
+// isolation behaviour is exercised rather than assumed.
+func (store *memoryStore) Summary(tenantID string) (Summary, error) {
+	summary := Summary{}
+	for _, event := range store.events {
+		if event.TenantID != tenantID {
+			continue
+		}
+		summary.Events++
+		switch event.Event.Type {
+		case "logs":
+			summary.Logs++
+		case "metrics":
+			summary.Metrics++
+		case "traces":
+			summary.Traces++
+		}
+		if summary.LastReceived == nil || event.Received.After(*summary.LastReceived) {
+			received := event.Received
+			summary.LastReceived = &received
+		}
+	}
+	return summary, nil
+}
+
+func (store *memoryStore) Recent(tenantID string, limit int) ([]StoredEvent, error) {
+	matching := make([]StoredEvent, 0, len(store.events))
+	for _, event := range store.events {
+		if event.TenantID == tenantID {
+			matching = append(matching, event)
+		}
+	}
+	if len(matching) > limit {
+		matching = matching[len(matching)-limit:]
+	}
+	return matching, nil
 }
 
 func TestServiceRequiresTenantAndToken(t *testing.T) {
@@ -37,16 +71,16 @@ func TestServiceRequiresTenantAndToken(t *testing.T) {
 
 func TestServiceValidatesAndPersistsEnvelope(t *testing.T) {
 	store := &memoryStore{}
-	service, err := New(Config{TenantID: "tenant-a", Token: "secret"}, store, slog.Default())
+	service, err := New(Config{Tenants: []Tenant{{ID: "tenant-a", Token: "secret"}}}, store, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(service.Handler())
 	defer server.Close()
 
-	envelope := agent.Envelope{
+	envelope := telemetry.Envelope{
 		TenantID: "tenant-a",
-		Events:   []agent.Event{{Type: "logs", Timestamp: time.Now().UTC(), Payload: json.RawMessage(`{"message":"hello"}`)}},
+		Events:   []telemetry.Event{{Type: "logs", Timestamp: time.Now().UTC(), Payload: json.RawMessage(`{"message":"hello"}`)}},
 	}
 	body, _ := json.Marshal(envelope)
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/intake", bytes.NewReader(body))
@@ -62,7 +96,7 @@ func TestServiceValidatesAndPersistsEnvelope(t *testing.T) {
 }
 
 func TestServiceRejectsWrongTenantAndCredentials(t *testing.T) {
-	service, err := New(Config{TenantID: "tenant-a", Token: "secret"}, &memoryStore{}, slog.Default())
+	service, err := New(Config{Tenants: []Tenant{{ID: "tenant-a", Token: "secret"}}}, &memoryStore{}, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,10 +123,10 @@ func TestServiceRejectsWrongTenantAndCredentials(t *testing.T) {
 
 func TestServiceQueriesSummaryAndRecentTelemetry(t *testing.T) {
 	store := &memoryStore{events: []StoredEvent{
-		{TenantID: "tenant-a", Received: time.Now().UTC().Add(-time.Minute), Event: agent.Event{Type: "logs", Payload: json.RawMessage(`{"message":"first"}`)}},
-		{TenantID: "tenant-a", Received: time.Now().UTC(), Event: agent.Event{Type: "traces", Payload: json.RawMessage(`{"resourceSpans":[]}`)}},
+		{TenantID: "tenant-a", Received: time.Now().UTC().Add(-time.Minute), Event: telemetry.Event{Type: "logs", Payload: json.RawMessage(`{"message":"first"}`)}},
+		{TenantID: "tenant-a", Received: time.Now().UTC(), Event: telemetry.Event{Type: "traces", Payload: json.RawMessage(`{"resourceSpans":[]}`)}},
 	}}
-	service, err := New(Config{TenantID: "tenant-a", Token: "secret"}, store, slog.Default())
+	service, err := New(Config{Tenants: []Tenant{{ID: "tenant-a", Token: "secret"}}}, store, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +160,7 @@ func TestServiceQueriesSummaryAndRecentTelemetry(t *testing.T) {
 
 func TestAWSIngestionRoutes(t *testing.T) {
 	store := &memoryStore{}
-	service, err := New(Config{TenantID: "tenant-a", Token: "secret"}, store, slog.Default())
+	service, err := New(Config{Tenants: []Tenant{{ID: "tenant-a", Token: "secret"}}}, store, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,5 +196,88 @@ func TestAWSIngestionRoutes(t *testing.T) {
 	}
 	if len(store.events) != 3 {
 		t.Fatalf("expected 3 AWS events, got %d", len(store.events))
+	}
+}
+
+// Two tenants sharing one intake must never see each other's telemetry, and a
+// forged tenant claim in the body must not override the credential.
+func TestTenantsAreIsolated(t *testing.T) {
+	store := &memoryStore{}
+	service, err := New(Config{Tenants: []Tenant{
+		{ID: "tenant-a", Token: "token-a"},
+		{ID: "tenant-b", Token: "token-b"},
+	}}, store, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(service.Handler())
+	defer server.Close()
+
+	send := func(token, envelopeTenant string) int {
+		envelope := telemetry.Envelope{TenantID: envelopeTenant, Events: []telemetry.Event{{
+			Type: "logs", Timestamp: time.Now().UTC(), Payload: json.RawMessage(`{"message":"hello"}`),
+		}}}
+		body, marshalErr := json.Marshal(envelope)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/intake", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		response, requestErr := http.DefaultClient.Do(req)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		response.Body.Close()
+		return response.StatusCode
+	}
+
+	if status := send("token-a", "tenant-a"); status != http.StatusAccepted {
+		t.Fatalf("tenant-a write rejected: %d", status)
+	}
+	// Claiming another tenant with your own credential must be refused.
+	if status := send("token-a", "tenant-b"); status != http.StatusBadRequest {
+		t.Fatalf("cross-tenant write should be rejected, got %d", status)
+	}
+	// An omitted tenant is attributed to the authenticated one.
+	if status := send("token-b", ""); status != http.StatusAccepted {
+		t.Fatalf("tenant-b write rejected: %d", status)
+	}
+
+	summaryFor := func(token string) map[string]any {
+		req, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/summary", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		response, requestErr := http.DefaultClient.Do(req)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		defer response.Body.Close()
+		var payload map[string]any
+		if decodeErr := json.NewDecoder(response.Body).Decode(&payload); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		return payload
+	}
+
+	if events := summaryFor("token-a")["events"]; events != float64(1) {
+		t.Fatalf("tenant-a should see exactly its own event, saw %v", events)
+	}
+	if events := summaryFor("token-b")["events"]; events != float64(1) {
+		t.Fatalf("tenant-b should see exactly its own event, saw %v", events)
+	}
+
+	for _, event := range store.events {
+		if event.TenantID != "tenant-a" && event.TenantID != "tenant-b" {
+			t.Fatalf("event stored under unexpected tenant %q", event.TenantID)
+		}
+	}
+}
+
+func TestConfigRejectsSharedTokens(t *testing.T) {
+	_, err := New(Config{Tenants: []Tenant{
+		{ID: "tenant-a", Token: "same"},
+		{ID: "tenant-b", Token: "same"},
+	}}, &memoryStore{}, slog.Default())
+	if err == nil {
+		t.Fatal("two tenants sharing a token must be rejected: the token cannot identify a tenant")
 	}
 }
