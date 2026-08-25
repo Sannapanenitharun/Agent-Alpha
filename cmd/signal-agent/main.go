@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/signal-observability/collector/internal/agent"
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -28,28 +33,58 @@ func main() {
 	if config.GRPCListenAddress == "" {
 		config.GRPCListenAddress = ":4317"
 	}
-	if config.FlushInterval <= 0 {
-		config.FlushInterval = 2 * time.Second
-	}
 	collector, err := agent.New(config, logger)
 	if err != nil {
 		logger.Error("collector configuration failed", "error", err)
 		os.Exit(1)
 	}
-	logger.Info("signal collector listening", "address", config.ListenAddress, "tenant", config.TenantID)
+
 	grpcListener, err := net.Listen("tcp", config.GRPCListenAddress)
 	if err != nil {
 		logger.Error("gRPC listener failed", "address", config.GRPCListenAddress, "error", err)
 		os.Exit(1)
 	}
+	grpcServer := collector.GRPCServer()
 	go func() {
 		logger.Info("signal collector gRPC listening", "address", config.GRPCListenAddress, "tenant", config.TenantID)
-		if err := collector.GRPCServer().Serve(grpcListener); err != nil {
+		if err := grpcServer.Serve(grpcListener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			logger.Error("collector gRPC stopped", "error", err)
 		}
 	}()
-	if err := http.ListenAndServe(config.ListenAddress, collector.Handler()); err != nil {
-		logger.Error("collector stopped", "error", err)
-		os.Exit(1)
+
+	// Timeouts are required: without them a single slow client can hold a
+	// connection open indefinitely.
+	server := &http.Server{
+		Addr:              config.ListenAddress,
+		Handler:           collector.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
+	go func() {
+		logger.Info("signal collector listening", "address", config.ListenAddress, "tenant", config.TenantID)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("collector stopped", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	logger.Info("shutdown requested, draining telemetry")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Error("http shutdown failed", "error", err)
+	}
+	grpcServer.GracefulStop()
+	// Drain last: the listeners must be closed first so nothing new arrives
+	// while the queue is being flushed.
+	if err := collector.Shutdown(ctx); err != nil {
+		logger.Error("collector drain incomplete", "error", err)
+	}
+	logger.Info("shutdown complete")
 }

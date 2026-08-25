@@ -21,6 +21,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sns v1.42.6
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.46.6
 	github.com/aws/aws-sdk-go-v2/service/sts v1.45.6
+	github.com/aws/smithy-go v1.27.8
 	go.opentelemetry.io/proto/otlp v1.11.0
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.12
@@ -39,7 +40,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/signin v1.5.6 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.33.6 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.6 // indirect
-	github.com/aws/smithy-go v1.27.8 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/rogpeppe/go-internal v1.16.0 // indirect

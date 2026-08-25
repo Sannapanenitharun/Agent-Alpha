@@ -5,8 +5,9 @@ import { useEffect, useState } from 'react';
 
 type Summary = { events: number; logs: number; metrics: number; traces: number; last_received: string | null };
 type Event = { tenant_id: string; received_at: string; event: { type: 'logs' | 'metrics' | 'traces'; timestamp: string; payload: Record<string, unknown> } };
-const apiBase = process.env.NEXT_PUBLIC_SIGNAL_API_URL ?? 'http://localhost:8080';
-const token = process.env.NEXT_PUBLIC_SIGNAL_TOKEN ?? 'local-only-token';
+// Queries go through the server-side proxy at /api/signal so the intake
+// credential stays on the server and the browser request is same-origin.
+const apiBase = '/api/signal';
 
 export default function Dashboard() {
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -18,10 +19,9 @@ export default function Dashboard() {
   async function loadData() {
     try {
       setError('');
-      const headers = { Authorization: `Bearer ${token}` };
       const [summaryResponse, eventsResponse] = await Promise.all([
-        fetch(`${apiBase}/v1/summary`, { headers, cache: 'no-store' }),
-        fetch(`${apiBase}/v1/telemetry?limit=12`, { headers, cache: 'no-store' }),
+        fetch(`${apiBase}/summary`, { cache: 'no-store' }),
+        fetch(`${apiBase}/telemetry?limit=12`, { cache: 'no-store' }),
       ]);
       if (!summaryResponse.ok || !eventsResponse.ok) throw new Error('Signal intake is not reachable');
       setSummary(await summaryResponse.json());

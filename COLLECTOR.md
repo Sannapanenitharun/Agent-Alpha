@@ -74,3 +74,140 @@ Send `Authorization: Bearer <ingest-token>` or `X-Signal-Ingest-Token`. The pref
 ## Production hardening before GA
 
 Implement mTLS or signed short-lived agent credentials, persistent disk buffering, remote configuration, config reload, compression, payload redaction, rate telemetry, and a dead-letter path.
+
+## Compression
+
+Both transports accept gzip, which standard OTLP exporters enable by default:
+
+- HTTP: `Content-Encoding: gzip` is decompressed, bounded at 10 MiB before and after inflation.
+- gRPC: the gzip decompressor is registered, so exporters using the default
+  `compression: gzip` setting are accepted.
+
+Without this, an OTel exporter fails with
+`Unimplemented: grpc: Decompressor is not installed for grpc-encoding "gzip"`.
+
+## EC2 reference deployment
+
+Deployed on an Ubuntu 24.04 EC2 host. All listeners bind `127.0.0.1`;
+nothing is publicly exposed and no security-group change is required.
+
+| Component | Address | Managed by |
+|---|---|---|
+| signal-agent OTLP HTTP | `127.0.0.1:14318` | `signal-agent.service` |
+| signal-agent OTLP gRPC | `127.0.0.1:14317` | `signal-agent.service` |
+| signal-intake | `127.0.0.1:18080` | `signal-intake.service` |
+| host metrics + logs scraper | otelcol-contrib | `signal-hostmetrics` container |
+
+Non-default ports are required because `4317`, `4318`, and `8080` are already
+taken on that host by `grafana/otel-lgtm` and `nginx-api-monitoring`.
+
+Layout:
+
+```text
+/opt/signal/bin/{signal-agent,signal-intake}   binaries
+/etc/signal/{agent,intake}.env                 credentials, 0640 root:signal
+/etc/signal/otel/host-config.yaml              scraper config
+/var/lib/signal/telemetry.jsonl                stored telemetry
+```
+
+Both services run as the unprivileged `signal` user with `ProtectSystem=strict`
+and `NoNewPrivileges`. To view the data locally:
+
+```bash
+ssh -i <key>.pem -L 18080:127.0.0.1:18080 ubuntu@<ec2-host>
+SIGNAL_API_URL=http://localhost:18080 SIGNAL_API_TOKEN=<token> npm run dev
+```
+
+The `process` scraper cannot read `/proc/1/exe` without `CAP_SYS_PTRACE`; other
+host metrics are unaffected.
+
+## Dashboard credentials
+
+The dashboard reads telemetry through its own server-side proxy at
+`/api/signal`, which holds the intake token and forwards only the read-only
+`summary` and `telemetry` endpoints. Configure it with `SIGNAL_API_URL` and
+`SIGNAL_API_TOKEN`.
+
+Never use a `NEXT_PUBLIC_` prefix for the token. Next.js inlines those into the
+client bundle, and the intake token is a write credential that also authenticates
+`POST /v1/intake`. Routing through the proxy also keeps the browser request
+same-origin, which the intake service requires: it serves no CORS headers and
+answers preflight `OPTIONS` with 405.
+
+## Pipeline self-telemetry
+
+`GET /v1/stats` on the collector reports `queued`, `queue_capacity`,
+`delivered`, and `dropped`. It requires the ingest token.
+
+## Tenants
+
+The intake gateway resolves a request's tenant from the bearer token it
+presents. Configure the registry with `SIGNAL_INTAKE_TENANTS_FILE`, a JSON array:
+
+```json
+[
+  {"id": "acme",   "token": "..."},
+  {"id": "globex", "token": "..."}
+]
+```
+
+Two tenants may not share a token — a shared token cannot identify a tenant, so
+the service refuses to start. For local development, `SIGNAL_INTAKE_TOKEN` plus
+`SIGNAL_INTAKE_TENANT_ID` still configure a single tenant.
+
+An envelope may carry a `tenant_id`, but it is a claim, not identity: if it
+disagrees with the authenticated tenant the request is rejected with 400.
+Queries are scoped the same way, so one tenant's credential cannot read
+another's telemetry.
+
+## Installing the agent
+
+### Linux with systemd
+
+```bash
+sudo ./scripts/install-agent.sh   --intake-url https://intake.example.com/v1/intake   --tenant acme   --token "$SIGNAL_INGEST_TOKEN"
+```
+
+Run from a source checkout it builds the binary itself; otherwise pass
+`--binary /path/to/signal-agent`. Re-running upgrades in place: the binary is
+replaced and the service restarted.
+
+Listen addresses default to `127.0.0.1:4318` (HTTP) and `127.0.0.1:4317` (gRPC).
+Override with `--http-addr` / `--grpc-addr`, and bind beyond loopback only with
+TLS in front. Use `--no-start` to stage an install without enabling the service.
+
+The installer creates an unprivileged `signal` user, writes
+`/etc/signal/agent.env` as `0640 root:signal`, and runs the service with
+`NoNewPrivileges`, `ProtectSystem=strict`, and `ProtectHome`.
+
+```bash
+systemctl status signal-agent
+journalctl -u signal-agent -f
+```
+
+### Container
+
+```bash
+docker run -d --name signal-agent   -p 4317:4317 -p 4318:4318   -e SIGNAL_INTAKE_URL=https://intake.example.com/v1/intake   -e SIGNAL_TENANT_ID=acme   -e SIGNAL_INGEST_TOKEN="$SIGNAL_INGEST_TOKEN"   -e SIGNAL_AGENT_LISTEN_ADDRESS=:4318   -e SIGNAL_AGENT_GRPC_LISTEN_ADDRESS=:4317   signal-agent:latest
+```
+
+Build the image with `docker build -t signal-agent:latest .`.
+
+On PowerShell the `\` line continuations above are not understood — it uses a
+backtick instead. Simplest is to keep it on one line:
+
+```powershell
+docker run -d --name signal-agent -p 4317:4317 -p 4318:4318 -e SIGNAL_INTAKE_URL=https://intake.example.com/v1/intake -e SIGNAL_TENANT_ID=acme -e SIGNAL_INGEST_TOKEN=$env:SIGNAL_INGEST_TOKEN -e SIGNAL_AGENT_LISTEN_ADDRESS=:4318 -e SIGNAL_AGENT_GRPC_LISTEN_ADDRESS=:4317 signal-agent:latest
+```
+
+Note `$env:NAME` rather than `$NAME` for environment variables. If the compose
+stack is already running it owns 4317 and 4318, so either stop it first or map
+different host ports, for example `-p 14317:4317 -p 14318:4318`.
+
+### Uninstall
+
+```bash
+sudo systemctl disable --now signal-agent
+sudo rm -rf /opt/signal/bin/signal-agent /etc/signal/agent.env             /etc/systemd/system/signal-agent.service
+sudo systemctl daemon-reload
+```

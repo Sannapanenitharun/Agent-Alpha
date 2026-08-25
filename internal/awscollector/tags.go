@@ -5,11 +5,11 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
-	"github.com/signal-observability/collector/internal/agent"
+	"github.com/signal-observability/collector/internal/telemetry"
 )
 
-func (c *Collector) collectTags(ctx context.Context) ([]agent.Event, error) {
-	var events []agent.Event
+func (c *Collector) collectTags(ctx context.Context) ([]telemetry.Event, error) {
+	var events []telemetry.Event
 	input := &resourcegroupstaggingapi.GetResourcesInput{}
 	for {
 		output, err := c.tags.GetResources(ctx, input)

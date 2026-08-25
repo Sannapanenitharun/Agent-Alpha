@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	logsdatav1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	metricsdatav1 "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracedatav1 "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
@@ -172,5 +175,216 @@ func TestCollectorAcceptsAuthenticatedOTLPGRPC(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for gRPC intake delivery")
+	}
+}
+
+func TestCollectorAcceptsGzippedOTLP(t *testing.T) {
+	received := make(chan Envelope, 1)
+	intake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var envelope Envelope
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			t.Errorf("invalid envelope: %v", err)
+		}
+		received <- envelope
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer intake.Close()
+
+	collector, err := New(Config{IntakeURL: intake.URL, TenantID: "tenant-gzip", Token: "secret", BatchSize: 1, FlushInterval: time.Hour}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(collector.Handler())
+	defer server.Close()
+
+	raw, err := proto.Marshal(&metricsv1.ExportMetricsServiceRequest{ResourceMetrics: []*metricsdatav1.ResourceMetrics{{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err = writer.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/metrics", bytes.NewReader(compressed.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Set("Content-Encoding", "gzip")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("gzipped OTLP was not accepted: status %d", response.StatusCode)
+	}
+
+	select {
+	case envelope := <-received:
+		if len(envelope.Events) != 1 || envelope.Events[0].Type != "metrics" {
+			t.Fatalf("unexpected gzip envelope: %+v", envelope)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for gzipped OTLP delivery")
+	}
+}
+
+func TestCollectorGRPCAdvertisesGzipDecompressor(t *testing.T) {
+	if encoding.GetCompressor("gzip") == nil {
+		t.Fatal("gzip compressor is not registered; standard OTLP gRPC exporters will fail")
+	}
+}
+
+// A single unparseable event must not stall delivery of everything behind it.
+func TestCollectorDropsPoisonBatchAndKeepsDelivering(t *testing.T) {
+	var delivered atomic.Int64
+	intake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		delivered.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer intake.Close()
+
+	collector, err := New(Config{IntakeURL: intake.URL, TenantID: "t", Token: "secret", BatchSize: 1, FlushInterval: 20 * time.Millisecond}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collector.Shutdown(context.Background())
+	server := httptest.NewServer(collector.Handler())
+	defer server.Close()
+
+	post := func(body, contentType string) int {
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/logs", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret")
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		response, requestErr := http.DefaultClient.Do(req)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		response.Body.Close()
+		return response.StatusCode
+	}
+
+	if status := post(`{"ok":true}`, ""); status != http.StatusAccepted {
+		t.Fatalf("valid event rejected: status %d", status)
+	}
+	// The malformed payload must be refused at the edge, not accepted and then
+	// silently jammed in the pipeline.
+	if status := post(`not-json-at-all`, "text/plain"); status != http.StatusBadRequest {
+		t.Fatalf("malformed payload should be rejected with 400, got %d", status)
+	}
+	for i := 0; i < 3; i++ {
+		post(`{"ok":true}`, "")
+	}
+
+	deadline := time.After(3 * time.Second)
+	for delivered.Load() < 4 {
+		select {
+		case <-deadline:
+			t.Fatalf("pipeline stalled: only %d of 4 events delivered", delivered.Load())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// Even if an unencodable event reaches the queue, the batch must not be retried
+// forever at the expense of every later event.
+func TestCollectorRecoversFromUnencodableEvent(t *testing.T) {
+	var delivered atomic.Int64
+	intake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		delivered.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer intake.Close()
+
+	collector, err := New(Config{IntakeURL: intake.URL, TenantID: "t", Token: "secret", BatchSize: 1, FlushInterval: 20 * time.Millisecond}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collector.Shutdown(context.Background())
+
+	collector.queue <- Event{Type: "logs", Timestamp: time.Now(), Payload: json.RawMessage("not-json")}
+	collector.queue <- Event{Type: "logs", Timestamp: time.Now(), Payload: json.RawMessage(`{"ok":true}`)}
+
+	deadline := time.After(3 * time.Second)
+	for delivered.Load() < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("collector never recovered from an unencodable event")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if collector.dropped.Load() == 0 {
+		t.Fatal("dropped counter should record the discarded batch")
+	}
+}
+
+func TestCollectorShutdownDrainsQueuedEvents(t *testing.T) {
+	var received atomic.Int64
+	intake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var envelope Envelope
+		if err := json.Unmarshal(body, &envelope); err == nil {
+			received.Add(int64(len(envelope.Events)))
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer intake.Close()
+
+	// A long flush interval guarantees the events are still queued at shutdown.
+	collector, err := New(Config{IntakeURL: intake.URL, TenantID: "t", Token: "secret", BatchSize: 1000, FlushInterval: time.Hour}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if err = collector.enqueue("logs", []byte(`{"ok":true}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err = collector.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown did not complete: %v", err)
+	}
+	if received.Load() != 5 {
+		t.Fatalf("shutdown lost telemetry: delivered %d of 5", received.Load())
+	}
+}
+
+func TestCollectorRejectsLookalikeContentType(t *testing.T) {
+	collector, err := New(Config{IntakeURL: "http://intake", TenantID: "t", Token: "secret"}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collector.Shutdown(context.Background())
+	server := httptest.NewServer(collector.Handler())
+	defer server.Close()
+
+	// "application/json-lines" must not be treated as OTLP JSON, and charset
+	// parameters must not defeat the match either.
+	for contentType, wanted := range map[string]int{
+		"application/json-lines":          http.StatusAccepted,
+		"application/json; charset=utf-8": http.StatusBadRequest,
+	} {
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/logs", strings.NewReader(`{"ok":true}`))
+		req.Header.Set("Authorization", "Bearer secret")
+		req.Header.Set("Content-Type", contentType)
+		response, requestErr := http.DefaultClient.Do(req)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		response.Body.Close()
+		if response.StatusCode != wanted {
+			t.Errorf("content type %q: got status %d, want %d", contentType, response.StatusCode, wanted)
+		}
 	}
 }
