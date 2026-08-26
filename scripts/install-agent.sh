@@ -137,14 +137,19 @@ chmod 644 "$UNIT"
 
 if [ "$START" -eq 1 ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl daemon-reload
-  systemctl enable --now signal-agent.service
+  systemctl enable signal-agent.service
+  # restart, not "enable --now": --now only starts a stopped service, so an
+  # upgrade over a running agent would leave the old process alive with the new
+  # binary sitting unused on disk.
+  systemctl restart signal-agent.service
   sleep 2
   if ! systemctl is-active --quiet signal-agent.service; then
     echo "service failed to start; recent log:" >&2
     journalctl -u signal-agent -n 20 --no-pager >&2 || true
     exit 1
   fi
-  echo "signal-agent is running"
+  started_at="$(systemctl show -p ActiveEnterTimestamp --value signal-agent.service || true)"
+  echo "signal-agent is running (started $started_at)"
 else
   echo "installed without starting (no systemd, or --no-start)"
 fi
